@@ -1,0 +1,19 @@
+[package]
+name = "stitch-ui-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "UI-agnostic workbench state and commands"
+
+[dependencies]
+stitch-domain.workspace = true
+stitch-application.workspace = true
+thiserror.workspace = true
+log.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints.rust]
+unsafe_code = "forbid"

@@ -1,0 +1,22 @@
+[package]
+name = "stitch-contract-tests"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Cross-adapter contract and end-to-end tests"
+publish = false
+
+[dev-dependencies]
+stitch-domain.workspace = true
+stitch-application.workspace = true
+stitch-vision.workspace = true
+stitch-imaging.workspace = true
+stitch-ui-core.workspace = true
+stitch-renderer-wgpu.workspace = true
+stitch-testkit.workspace = true
+nalgebra.workspace = true
+tempfile.workspace = true
+
+[lints.rust]
+unsafe_code = "forbid"

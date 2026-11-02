@@ -1,0 +1,20 @@
+[package]
+name = "stitch-imaging"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Filesystem image repository and CPU compositor adapters"
+
+[dependencies]
+stitch-domain.workspace = true
+image.workspace = true
+rayon.workspace = true
+log.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints.rust]
+unsafe_code = "forbid"

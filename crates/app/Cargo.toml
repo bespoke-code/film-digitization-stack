@@ -1,0 +1,26 @@
+[package]
+name = "scan-to-img"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Native desktop application for stitching high-resolution film scans"
+default-run = "scan-to-img"
+
+[[bin]]
+name = "scan-to-img"
+path = "src/main.rs"
+
+[dependencies]
+stitch-domain.workspace = true
+stitch-application.workspace = true
+stitch-vision.workspace = true
+stitch-imaging.workspace = true
+stitch-ui-core.workspace = true
+stitch-ui-egui.workspace = true
+eframe.workspace = true
+env_logger.workspace = true
+log.workspace = true
+
+[lints.rust]
+unsafe_code = "forbid"

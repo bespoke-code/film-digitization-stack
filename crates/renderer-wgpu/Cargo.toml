@@ -1,0 +1,16 @@
+[package]
+name = "stitch-renderer-wgpu"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "wgpu preview renderer adapter (Metal, Vulkan, DX12, WebGPU)"
+
+[dependencies]
+stitch-domain.workspace = true
+wgpu.workspace = true
+bytemuck.workspace = true
+log.workspace = true
+
+[lints.rust]
+unsafe_code = "forbid"

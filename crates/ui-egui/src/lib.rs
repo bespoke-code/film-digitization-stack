@@ -1,0 +1,799 @@
+//! egui adapter for the scan-to-img workbench.
+//!
+//! The adapter only renders [`Workbench`] state and forwards user intents.
+//! Stitching runs on a background thread; the GPU preview goes through
+//! [`stitch_renderer_wgpu::PreviewRenderer`] inside an egui-wgpu paint callback.
+
+mod dialog;
+
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::thread::JoinHandle;
+
+use dialog::{images_in_folder, is_supported_image, DialogMode, DialogOutcome, FileDialog};
+use eframe::egui;
+use stitch_application::{ProjectService, StitchService};
+use stitch_domain::{
+    CoreResult, ImageId, ImageLocator, RgbaImage, SourceImage, StitchOptions, StitchProgress,
+    StitchResult,
+};
+use stitch_renderer_wgpu::PreviewRenderer;
+use stitch_ui_core::{PreviewInfo, PreviewTarget, Workbench, WorkbenchStatus};
+
+enum WorkerEvent {
+    Progress(StitchProgress),
+    Done(Box<CoreResult<StitchResult>>),
+}
+
+struct StitchWorker {
+    receiver: Receiver<WorkerEvent>,
+    handle: Option<JoinHandle<()>>,
+}
+
+struct Histogram {
+    red: [u32; 256],
+    green: [u32; 256],
+    blue: [u32; 256],
+}
+
+impl Default for Histogram {
+    fn default() -> Self {
+        Self {
+            red: [0; 256],
+            green: [0; 256],
+            blue: [0; 256],
+        }
+    }
+}
+
+impl Histogram {
+    fn from_image(image: &RgbaImage) -> Self {
+        let mut histogram = Self::default();
+        let pixels = image.total_pixels();
+        let stride = (pixels / 200_000).max(1);
+        for (index, pixel) in image.pixels().as_chunks::<4>().0.iter().enumerate() {
+            if index % stride != 0 {
+                continue;
+            }
+            histogram.red[pixel[0] as usize] += 1;
+            histogram.green[pixel[1] as usize] += 1;
+            histogram.blue[pixel[2] as usize] += 1;
+        }
+        histogram
+    }
+
+    fn peak(&self) -> u32 {
+        self.red
+            .iter()
+            .chain(self.green.iter())
+            .chain(self.blue.iter())
+            .copied()
+            .max()
+            .unwrap_or(1)
+            .max(1)
+    }
+}
+
+#[derive(Default)]
+struct HistogramCache {
+    key: Option<(u64, String)>,
+    histogram: Histogram,
+}
+
+impl HistogramCache {
+    fn update(&mut self, preview: &PreviewInfo) {
+        let key = (preview.revision, preview.label.clone());
+        if self.key.as_ref() != Some(&key) {
+            self.histogram = Histogram::from_image(&preview.image);
+            self.key = Some(key);
+        }
+    }
+}
+
+struct PreviewState {
+    zoom: f32,
+    pan: egui::Vec2,
+    key: Option<(PreviewTarget, u32, u32)>,
+}
+
+impl Default for PreviewState {
+    fn default() -> Self {
+        Self {
+            zoom: 1.0,
+            pan: egui::Vec2::ZERO,
+            key: None,
+        }
+    }
+}
+
+struct PreviewCallback {
+    image: Option<std::sync::Arc<RgbaImage>>,
+    revision: u64,
+}
+
+impl egui_wgpu::CallbackTrait for PreviewCallback {
+    fn prepare(
+        &self,
+        device: &egui_wgpu::wgpu::Device,
+        queue: &egui_wgpu::wgpu::Queue,
+        _screen_descriptor: &egui_wgpu::ScreenDescriptor,
+        _encoder: &mut egui_wgpu::wgpu::CommandEncoder,
+        resources: &mut egui_wgpu::CallbackResources,
+    ) -> Vec<egui_wgpu::wgpu::CommandBuffer> {
+        if let Some(renderer) = resources.get_mut::<PreviewRenderer>() {
+            renderer.prepare(
+                device,
+                queue,
+                self.image.as_ref(),
+                self.revision,
+                [-1.0, 1.0, 1.0, -1.0],
+            );
+        }
+        Vec::new()
+    }
+
+    fn paint(
+        &self,
+        info: egui::PaintCallbackInfo,
+        pass: &mut egui_wgpu::wgpu::RenderPass<'static>,
+        resources: &egui_wgpu::CallbackResources,
+    ) {
+        if let Some(renderer) = resources.get::<PreviewRenderer>() {
+            // egui-wgpu sets the viewport but not the scissor for callbacks.
+            // Clip the image to the central panel so a zoomed image cannot
+            // paint over the side panels.
+            let clip = info.clip_rect_in_pixels();
+            let screen = [info.screen_size_px[0] as i32, info.screen_size_px[1] as i32];
+            let min_x = clip.left_px.max(0);
+            let min_y = clip.top_px.max(0);
+            let max_x = (clip.left_px + clip.width_px).min(screen[0]);
+            let max_y = (clip.top_px + clip.height_px).min(screen[1]);
+            if max_x > min_x && max_y > min_y {
+                pass.set_scissor_rect(
+                    min_x as u32,
+                    min_y as u32,
+                    (max_x - min_x) as u32,
+                    (max_y - min_y) as u32,
+                );
+                renderer.paint(pass);
+            }
+        }
+    }
+}
+
+/// The egui application shell.
+pub struct ScanToImgApp {
+    workbench: Workbench,
+    project_service: ProjectService,
+    stitch_service: StitchService,
+    worker: Option<StitchWorker>,
+    dialog: FileDialog,
+    thumbnails: HashMap<ImageId, egui::TextureHandle>,
+    options: StitchOptions,
+    preview: PreviewState,
+    histogram: HistogramCache,
+    gpu_available: bool,
+    pending_paths: Vec<PathBuf>,
+}
+
+impl ScanToImgApp {
+    pub fn new(
+        cc: &eframe::CreationContext<'_>,
+        project_service: ProjectService,
+        stitch_service: StitchService,
+        pending_paths: Vec<PathBuf>,
+    ) -> Self {
+        let gpu_available = if let Some(state) = cc.wgpu_render_state.as_ref() {
+            let renderer = PreviewRenderer::new(&state.device, state.target_format, 1);
+            state.renderer.write().callback_resources.insert(renderer);
+            true
+        } else {
+            log::error!("wgpu render state is unavailable; the preview will be disabled");
+            false
+        };
+
+        let options = StitchOptions::default();
+        Self {
+            workbench: Workbench::new(),
+            project_service,
+            stitch_service,
+            worker: None,
+            dialog: FileDialog::default(),
+            thumbnails: HashMap::new(),
+            options,
+            preview: PreviewState::default(),
+            histogram: HistogramCache::default(),
+            gpu_available,
+            pending_paths,
+        }
+    }
+
+    fn poll_worker(&mut self) {
+        let mut events = Vec::new();
+        let mut disconnected = false;
+        if let Some(worker) = &self.worker {
+            loop {
+                match worker.receiver.try_recv() {
+                    Ok(event) => events.push(event),
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        disconnected = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        let mut finished = false;
+        for event in events {
+            match event {
+                WorkerEvent::Progress(progress) => self.workbench.report_progress(progress),
+                WorkerEvent::Done(result) => {
+                    match *result {
+                        Ok(result) => self.workbench.finish_stitch(result),
+                        Err(error) => self.workbench.fail_stitch(error.to_string()),
+                    }
+                    finished = true;
+                }
+            }
+        }
+        if disconnected && !finished {
+            self.workbench
+                .fail_stitch("The stitching worker stopped unexpectedly.");
+            finished = true;
+        }
+        if finished {
+            if let Some(mut worker) = self.worker.take() {
+                if let Some(handle) = worker.handle.take() {
+                    let _ = handle.join();
+                }
+            }
+        }
+    }
+
+    fn start_stitch(&mut self, ctx: &egui::Context) {
+        let job = match self.workbench.begin_stitch() {
+            Ok(job) => job,
+            Err(error) => {
+                self.workbench.fail_stitch(error.to_string());
+                return;
+            }
+        };
+        let service = self.stitch_service.clone();
+        let (sender, receiver) = mpsc::channel();
+        let progress_sender = sender.clone();
+        let progress_context = ctx.clone();
+        let finish_context = ctx.clone();
+        let handle = std::thread::spawn(move || {
+            let progress = move |progress: StitchProgress| {
+                let _ = progress_sender.send(WorkerEvent::Progress(progress));
+                progress_context.request_repaint();
+            };
+            let result = service.stitch(&job.images, &job.options, &progress);
+            let _ = sender.send(WorkerEvent::Done(Box::new(result)));
+            finish_context.request_repaint();
+        });
+        self.worker = Some(StitchWorker {
+            receiver,
+            handle: Some(handle),
+        });
+    }
+
+    fn add_paths(&mut self, paths: Vec<PathBuf>) {
+        let mut images = Vec::new();
+        for path in paths {
+            if path.is_dir() {
+                images.extend(images_in_folder(&path));
+            } else if is_supported_image(&path) {
+                images.push(path);
+            }
+        }
+        if images.is_empty() {
+            self.workbench
+                .notify("No supported images (PNG, JPEG, WebP, BMP, TIFF) were found.");
+            return;
+        }
+        let locators: Vec<ImageLocator> = images
+            .iter()
+            .map(|path| ImageLocator::from(path.as_path()))
+            .collect();
+        if let Err(error) = self.workbench.add_images(&self.project_service, &locators) {
+            self.workbench.fail_stitch(error.to_string());
+        }
+    }
+
+    fn remove_selected(&mut self) {
+        if let Some(id) = self.workbench.selected() {
+            if let Err(error) = self.workbench.remove_image(id) {
+                self.workbench.fail_stitch(error.to_string());
+            }
+        }
+    }
+
+    fn default_export_name(&self) -> String {
+        self.workbench
+            .project()
+            .images()
+            .first()
+            .and_then(|image| Path::new(image.locator.as_str()).file_stem())
+            .map(|stem| format!("{}-stitched.png", stem.to_string_lossy()))
+            .unwrap_or_else(|| "panorama.png".to_owned())
+    }
+
+    fn default_export_dir(&self) -> Option<PathBuf> {
+        self.workbench
+            .project()
+            .images()
+            .first()
+            .and_then(|image| Path::new(image.locator.as_str()).parent())
+            .map(Path::to_path_buf)
+    }
+
+    fn handle_dialog_outcome(&mut self, outcome: DialogOutcome) {
+        match outcome {
+            DialogOutcome::AddImages(paths) => self.add_paths(paths),
+            DialogOutcome::OpenFolder(folder) => {
+                let images = images_in_folder(&folder);
+                if images.is_empty() {
+                    self.workbench.fail_stitch(format!(
+                        "No supported images were found in {}.",
+                        folder.display()
+                    ));
+                } else {
+                    self.add_paths(images);
+                }
+            }
+            DialogOutcome::SaveImage(path) => {
+                let locator = ImageLocator::from(path.as_path());
+                match self.workbench.export(&self.project_service, &locator) {
+                    Ok(()) => self
+                        .workbench
+                        .notify(format!("Exported to {}", path.display())),
+                    Err(error) => self.workbench.fail_stitch(error.to_string()),
+                }
+            }
+        }
+    }
+
+    fn thumbnail(&mut self, ctx: &egui::Context, image: &SourceImage) -> egui::TextureHandle {
+        if let Some(texture) = self.thumbnails.get(&image.id) {
+            return texture.clone();
+        }
+        let thumbnail = image.thumbnail.as_ref();
+        let color = egui::ColorImage::from_rgba_unmultiplied(
+            [thumbnail.width() as usize, thumbnail.height() as usize],
+            thumbnail.pixels(),
+        );
+        let texture = ctx.load_texture(
+            format!("thumbnail-{}", image.id.0),
+            color,
+            egui::TextureOptions::LINEAR,
+        );
+        self.thumbnails.insert(image.id, texture.clone());
+        texture
+    }
+
+    fn toolbar(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
+        ui.horizontal_wrapped(|ui| {
+            ui.heading("Scan to image");
+            ui.separator();
+
+            let add_label = format!("Add images ({} left)", self.workbench.remaining_slots());
+            if ui
+                .add_enabled(self.workbench.can_add(), egui::Button::new(add_label))
+                .clicked()
+            {
+                self.dialog
+                    .open_in(DialogMode::AddImages, None, String::new());
+            }
+            if ui.button("Open folder").clicked() {
+                self.dialog
+                    .open_in(DialogMode::OpenFolder, None, String::new());
+            }
+            if ui
+                .add_enabled(
+                    self.workbench.selected().is_some(),
+                    egui::Button::new("Remove"),
+                )
+                .clicked()
+            {
+                self.remove_selected();
+            }
+            if ui
+                .add_enabled(
+                    self.workbench.selected().is_some() && !self.workbench.is_busy(),
+                    egui::Button::new("Move up"),
+                )
+                .clicked()
+            {
+                if let Some(id) = self.workbench.selected() {
+                    let _ = self.workbench.move_up(id);
+                }
+            }
+            if ui
+                .add_enabled(
+                    self.workbench.selected().is_some() && !self.workbench.is_busy(),
+                    egui::Button::new("Move down"),
+                )
+                .clicked()
+            {
+                if let Some(id) = self.workbench.selected() {
+                    let _ = self.workbench.move_down(id);
+                }
+            }
+            ui.separator();
+            if ui
+                .add_enabled(
+                    self.workbench.can_stitch(),
+                    egui::Button::new("Stitch panorama"),
+                )
+                .clicked()
+            {
+                self.start_stitch(ctx);
+            }
+            if ui
+                .add_enabled(self.workbench.can_export(), egui::Button::new("Export…"))
+                .clicked()
+            {
+                self.dialog.open_in(
+                    DialogMode::SaveImage,
+                    self.default_export_dir(),
+                    self.default_export_name(),
+                );
+            }
+            if ui.button("Clear").clicked() {
+                self.workbench.clear();
+                self.thumbnails.clear();
+            }
+        });
+    }
+
+    fn image_list(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
+        ui.heading("Images");
+        ui.weak(format!(
+            "{} of {} selected",
+            self.workbench.project().len(),
+            stitch_domain::MAX_IMAGES
+        ));
+        ui.separator();
+
+        let images = self.workbench.project().images().to_vec();
+        let selected = self.workbench.selected();
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                if images.is_empty() {
+                    ui.label("Drop images here, or use Add images.");
+                    return;
+                }
+                for image in &images {
+                    let texture = self.thumbnail(ctx, image);
+                    let is_selected = selected == Some(image.id);
+                    ui.horizontal(|ui| {
+                        let size = egui::vec2(56.0, 42.0);
+                        let scaled = fit_size(texture.size_vec2(), size);
+                        ui.image((texture.id(), scaled));
+                        ui.vertical(|ui| {
+                            if ui.selectable_label(is_selected, &image.name).clicked() {
+                                let _ = self.workbench.select_image(image.id);
+                            }
+                            ui.weak(format!(
+                                "{} × {}",
+                                image.image.width(),
+                                image.image.height()
+                            ));
+                        });
+                    });
+                    ui.separator();
+                }
+            });
+    }
+
+    fn diagnostics(&self, ui: &mut egui::Ui) {
+        ui.heading("Diagnostics");
+        match self.workbench.result() {
+            Some(result) => {
+                let diagnostics = &result.diagnostics;
+                ui.label(format!(
+                    "Output: {} × {} at {:.0}% scale",
+                    diagnostics.output_width,
+                    diagnostics.output_height,
+                    diagnostics.output_scale * 100.0
+                ));
+                ui.label(format!(
+                    "Duration: {:.2}s",
+                    diagnostics.duration_ms as f64 / 1000.0
+                ));
+                ui.label(format!(
+                    "Features: {}",
+                    diagnostics
+                        .features_per_image
+                        .iter()
+                        .map(usize::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+                ui.separator();
+                egui::Grid::new("pair-diagnostics")
+                    .num_columns(4)
+                    .striped(true)
+                    .show(ui, |ui| {
+                        ui.strong("Pair");
+                        ui.strong("Matches");
+                        ui.strong("Inliers");
+                        ui.strong("Used");
+                        ui.end_row();
+                        for pair in &diagnostics.pairs {
+                            ui.label(format!("#{} → #{}", pair.from.0, pair.to.0));
+                            ui.label(pair.num_matches.to_string());
+                            ui.label(format!("{} ({:.2}px)", pair.num_inliers, pair.rms_error));
+                            ui.label(if pair.used_for_alignment { "yes" } else { "no" });
+                            ui.end_row();
+                        }
+                    });
+            }
+            None => {
+                ui.weak("Stitch a project to see registration diagnostics.");
+            }
+        }
+    }
+
+    fn settings(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Settings");
+        ui.add(egui::Slider::new(&mut self.options.match_ratio, 0.5..=0.95).text("Match ratio"));
+        ui.add(egui::Slider::new(&mut self.options.min_inliers, 6..=200).text("Minimum inliers"));
+        ui.add(
+            egui::Slider::new(&mut self.options.ransac_threshold, 0.5..=20.0)
+                .text("RANSAC threshold (px)"),
+        );
+        ui.add(
+            egui::Slider::new(&mut self.options.max_analysis_dimension, 320..=4096)
+                .text("Analysis size (px)"),
+        );
+        ui.add(
+            egui::Slider::new(&mut self.options.max_features, 100..=8000)
+                .text("Features per image"),
+        );
+        ui.add(egui::Slider::new(&mut self.options.feather_fraction, 0.0..=0.5).text("Feather"));
+        ui.add(
+            egui::Slider::new(&mut self.options.max_canvas_dimension, 512..=16_384)
+                .text("Max canvas side (px)"),
+        );
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(
+                    *self.workbench.options() != self.options,
+                    egui::Button::new("Apply"),
+                )
+                .clicked()
+            {
+                self.workbench.update_options(self.options.clone());
+            }
+            if ui.button("Reset").clicked() {
+                self.options = StitchOptions::default();
+            }
+        });
+        ui.weak("Settings changes discard the current panorama.");
+    }
+
+    fn status_bar(&mut self, ui: &mut egui::Ui) {
+        let status = self.workbench.status().clone();
+        ui.horizontal(|ui| match status {
+            WorkbenchStatus::Empty => {
+                ui.weak("Add up to sixteen overlapping images, then stitch.");
+            }
+            WorkbenchStatus::Ready(message) => {
+                ui.label(message);
+            }
+            WorkbenchStatus::Busy {
+                stage,
+                fraction,
+                message,
+            } => {
+                ui.spinner();
+                ui.label(format!("{}: {message}", stage.label()));
+                if let Some(fraction) = fraction {
+                    ui.add(
+                        egui::ProgressBar::new(fraction)
+                            .desired_width(220.0)
+                            .show_percentage(),
+                    );
+                }
+            }
+            WorkbenchStatus::Failed(message) => {
+                ui.colored_label(egui::Color32::from_rgb(230, 110, 110), message);
+                if ui.small_button("Dismiss").clicked() {
+                    self.workbench.acknowledge_error();
+                }
+            }
+        });
+    }
+
+    fn preview_area(&mut self, ui: &mut egui::Ui) {
+        let Some(preview) = self.workbench.preview() else {
+            ui.centered_and_justified(|ui| {
+                ui.weak("Add images to start. Drag and drop works too.");
+            });
+            return;
+        };
+
+        let image_size = egui::vec2(preview.image.width() as f32, preview.image.height() as f32);
+        let key = (
+            self.workbench.preview_target(),
+            preview.image.width(),
+            preview.image.height(),
+        );
+        if self.preview.key != Some(key) {
+            self.preview.key = Some(key);
+            self.preview.zoom = 1.0;
+            self.preview.pan = egui::Vec2::ZERO;
+        }
+
+        ui.horizontal(|ui| {
+            ui.label(&preview.label);
+            if self.workbench.result().is_some() && ui.button("Show panorama").clicked() {
+                let _ = self.workbench.show_stitched();
+            }
+            ui.separator();
+            if ui.button("−").clicked() {
+                self.preview.zoom = (self.preview.zoom / 1.25).max(0.1);
+            }
+            ui.label(format!("{:.0}%", self.preview.zoom * 100.0));
+            if ui.button("+").clicked() {
+                self.preview.zoom = (self.preview.zoom * 1.25).min(20.0);
+            }
+            if ui.button("Fit").clicked() {
+                self.preview.zoom = 1.0;
+                self.preview.pan = egui::Vec2::ZERO;
+            }
+            ui.weak(format!(
+                "{} × {}",
+                preview.image.width(),
+                preview.image.height()
+            ));
+        });
+
+        let available = ui.available_size();
+        let (response, painter) = ui.allocate_painter(available, egui::Sense::click_and_drag());
+        let viewport = response.rect;
+        painter.rect_filled(viewport, 0.0, egui::Color32::from_gray(24));
+        painter.rect_stroke(
+            viewport,
+            0.0,
+            egui::Stroke::new(1.0_f32, egui::Color32::from_gray(60)),
+            egui::StrokeKind::Inside,
+        );
+
+        let fit = (viewport.width() / image_size.x)
+            .min(viewport.height() / image_size.y)
+            .max(0.0001);
+        let scale = fit * self.preview.zoom;
+        let display = image_size * scale;
+        let center = viewport.center() + self.preview.pan;
+        let image_rect = egui::Rect::from_center_size(center, display);
+
+        if response.dragged() {
+            self.preview.pan += response.drag_delta();
+        }
+        if response.hovered() {
+            let scroll = ui.input(|input| input.smooth_scroll_delta.y);
+            if scroll.abs() > 0.0 {
+                let factor = (scroll * 0.002).exp();
+                self.preview.zoom = (self.preview.zoom * factor).clamp(0.1, 20.0);
+            }
+        }
+
+        let visible = image_rect.intersect(viewport);
+        if visible.is_positive() {
+            painter.add(egui_wgpu::Callback::new_paint_callback(
+                image_rect,
+                PreviewCallback {
+                    image: Some(preview.image.clone()),
+                    revision: preview.revision,
+                },
+            ));
+        }
+    }
+}
+
+impl eframe::App for ScanToImgApp {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
+        self.poll_worker();
+        if !self.pending_paths.is_empty() {
+            let paths = std::mem::take(&mut self.pending_paths);
+            self.add_paths(paths);
+        }
+        let dropped: Vec<PathBuf> = ctx.input(|input| {
+            input
+                .raw
+                .dropped_files
+                .iter()
+                .map(|file| file.path().to_path_buf())
+                .collect()
+        });
+        if !dropped.is_empty() {
+            self.add_paths(dropped);
+        }
+
+        if let Some(outcome) = self.dialog.show(&ctx) {
+            self.handle_dialog_outcome(outcome);
+        }
+
+        egui::Panel::top("toolbar").show(ui, |ui| {
+            self.toolbar(&ctx, ui);
+        });
+        egui::Panel::bottom("status").show(ui, |ui| {
+            self.status_bar(ui);
+        });
+        egui::Panel::left("images")
+            .resizable(true)
+            .default_size(280.0)
+            .size_range(220.0..=420.0)
+            .show(ui, |ui| {
+                self.image_list(&ctx, ui);
+            });
+        egui::Panel::right("inspector")
+            .resizable(true)
+            .default_size(320.0)
+            .size_range(260.0..=460.0)
+            .show(ui, |ui| {
+                if let Some(preview) = self.workbench.preview() {
+                    self.histogram.update(&preview);
+                    ui.heading("Histogram");
+                    draw_histogram(ui, &self.histogram.histogram);
+                }
+                ui.separator();
+                egui::CollapsingHeader::new("Stitch settings")
+                    .default_open(false)
+                    .show(ui, |ui| self.settings(ui));
+                egui::CollapsingHeader::new("Diagnostics")
+                    .default_open(true)
+                    .show(ui, |ui| self.diagnostics(ui));
+            });
+        egui::CentralPanel::default().show(ui, |ui| {
+            if self.gpu_available {
+                self.preview_area(ui);
+            } else {
+                ui.centered_and_justified(|ui| {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(230, 110, 110),
+                        "GPU preview unavailable. Start the app with a wgpu-capable backend.",
+                    );
+                });
+            }
+        });
+    }
+}
+
+fn fit_size(texture: egui::Vec2, bounds: egui::Vec2) -> egui::Vec2 {
+    if texture.x <= 0.0 || texture.y <= 0.0 {
+        return bounds;
+    }
+    let scale = (bounds.x / texture.x).min(bounds.y / texture.y);
+    texture * scale
+}
+
+fn draw_histogram(ui: &mut egui::Ui, histogram: &Histogram) {
+    let width = ui.available_width();
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 110.0), egui::Sense::hover());
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, 3.0, egui::Color32::from_gray(18));
+    let peak = histogram.peak() as f32;
+    let to_screen = |bin: usize, value: u32| {
+        egui::pos2(
+            rect.left() + rect.width() * bin as f32 / 255.0,
+            rect.bottom() - rect.height() * (value as f32 / peak).sqrt(),
+        )
+    };
+    let channels = [
+        (&histogram.red, egui::Color32::from_rgb(230, 90, 90)),
+        (&histogram.green, egui::Color32::from_rgb(90, 220, 120)),
+        (&histogram.blue, egui::Color32::from_rgb(100, 150, 240)),
+    ];
+    for (values, color) in channels {
+        let points: Vec<egui::Pos2> = (0..256).map(|bin| to_screen(bin, values[bin])).collect();
+        painter.add(egui::Shape::line(points, egui::Stroke::new(1.0_f32, color)));
+    }
+}

@@ -1,0 +1,18 @@
+[package]
+name = "stitch-testkit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "In-memory adapters and reusable contract test suites"
+
+[dependencies]
+stitch-domain.workspace = true
+stitch-application.workspace = true
+nalgebra.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints.rust]
+unsafe_code = "forbid"

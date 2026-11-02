@@ -1,0 +1,17 @@
+[package]
+name = "stitch-vision"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Pure Rust SIFT, ratio matcher and RANSAC homography estimator"
+
+[dependencies]
+stitch-domain.workspace = true
+nalgebra.workspace = true
+rayon.workspace = true
+log.workspace = true
+thiserror.workspace = true
+
+[lints.rust]
+unsafe_code = "forbid"

@@ -1,0 +1,15 @@
+[package]
+name = "stitch-application"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Use cases for registering and compositing scan images"
+
+[dependencies]
+stitch-domain.workspace = true
+thiserror.workspace = true
+log.workspace = true
+
+[lints.rust]
+unsafe_code = "forbid"

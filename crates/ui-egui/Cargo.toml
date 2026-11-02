@@ -1,0 +1,20 @@
+[package]
+name = "stitch-ui-egui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "egui adapter for the scan-to-img workbench"
+
+[dependencies]
+stitch-domain.workspace = true
+stitch-application.workspace = true
+stitch-ui-core.workspace = true
+stitch-renderer-wgpu.workspace = true
+egui.workspace = true
+egui-wgpu.workspace = true
+eframe.workspace = true
+log.workspace = true
+
+[lints.rust]
+unsafe_code = "forbid"
