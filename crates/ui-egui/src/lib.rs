@@ -162,6 +162,14 @@ impl egui_wgpu::CallbackTrait for PreviewCallback {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LevelChannel {
+    Red,
+    Green,
+    Blue,
+    Gray,
+}
+
 /// The egui application shell.
 pub struct ScanToImgApp {
     workbench: Workbench,
@@ -175,6 +183,11 @@ pub struct ScanToImgApp {
     histogram: HistogramCache,
     gpu_available: bool,
     pending_paths: Vec<PathBuf>,
+    picking_film_base: bool,
+    level_channel: LevelChannel,
+    crop_mode: bool,
+    crop_start: Option<egui::Pos2>,
+    crop_end: Option<egui::Pos2>,
 }
 
 impl ScanToImgApp {
@@ -206,6 +219,11 @@ impl ScanToImgApp {
             histogram: HistogramCache::default(),
             gpu_available,
             pending_paths,
+            picking_film_base: false,
+            level_channel: LevelChannel::Red,
+            crop_mode: false,
+            crop_start: None,
+            crop_end: None,
         }
     }
 
@@ -312,13 +330,18 @@ impl ScanToImgApp {
     }
 
     fn default_export_name(&self) -> String {
-        self.workbench
-            .project()
-            .images()
-            .first()
+        let image = match self.workbench.preview_target() {
+            PreviewTarget::Image(id) => self.workbench.project().get(id),
+            PreviewTarget::Stitched => self.workbench.project().images().first(),
+        };
+        let stem = image
             .and_then(|image| Path::new(image.locator.as_str()).file_stem())
-            .map(|stem| format!("{}-stitched.png", stem.to_string_lossy()))
-            .unwrap_or_else(|| "panorama.png".to_owned())
+            .map(|stem| stem.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "panorama".to_owned());
+        match self.workbench.preview_target() {
+            PreviewTarget::Stitched => format!("{stem}-stitched.png"),
+            PreviewTarget::Image(_) => format!("{stem}-edited.png"),
+        }
     }
 
     fn default_export_dir(&self) -> Option<PathBuf> {
@@ -350,6 +373,19 @@ impl ScanToImgApp {
                     Ok(()) => self
                         .workbench
                         .notify(format!("Exported to {}", path.display())),
+                    Err(error) => self.workbench.fail_stitch(error.to_string()),
+                }
+            }
+            DialogOutcome::SaveFolder(folder, format) => {
+                match self
+                    .workbench
+                    .export_all(&self.project_service, &folder, format.extension())
+                {
+                    Ok(count) => self.workbench.notify(format!(
+                        "Exported {count} image{} to {}.",
+                        if count == 1 { "" } else { "s" },
+                        folder.display()
+                    )),
                     Err(error) => self.workbench.fail_stitch(error.to_string()),
                 }
             }
@@ -442,6 +478,19 @@ impl ScanToImgApp {
                     self.default_export_name(),
                 );
             }
+            if ui
+                .add_enabled(
+                    !self.workbench.project().is_empty() && !self.workbench.is_busy(),
+                    egui::Button::new("Export all…"),
+                )
+                .clicked()
+            {
+                self.dialog.open_in(
+                    DialogMode::SaveFolder,
+                    self.default_export_dir(),
+                    String::new(),
+                );
+            }
             if ui.button("Clear").clicked() {
                 self.workbench.clear();
                 self.thumbnails.clear();
@@ -477,6 +526,7 @@ impl ScanToImgApp {
                         ui.vertical(|ui| {
                             if ui.selectable_label(is_selected, &image.name).clicked() {
                                 let _ = self.workbench.select_image(image.id);
+                                self.picking_film_base = false;
                             }
                             ui.weak(format!(
                                 "{} × {}",
@@ -577,6 +627,144 @@ impl ScanToImgApp {
         ui.weak("Settings changes discard the current panorama.");
     }
 
+    fn develop(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Develop");
+        if self.workbench.base_preview().is_none() {
+            ui.weak("Select an image or stitch a panorama to edit it.");
+            return;
+        }
+
+        let mut edits = self.workbench.current_edits();
+        let mut changed = false;
+        changed |= ui.checkbox(&mut edits.invert, "Invert negative").changed();
+        changed |= ui.checkbox(&mut edits.monochrome, "Monochrome").changed();
+
+        ui.horizontal(|ui| {
+            ui.label("Film base");
+            match edits.film_base {
+                Some(base) => draw_swatch(ui, base),
+                None => {
+                    ui.weak("none");
+                }
+            }
+            if ui
+                .selectable_label(self.picking_film_base, "Pick")
+                .clicked()
+            {
+                self.picking_film_base = !self.picking_film_base;
+            }
+            if ui.button("Auto").clicked() {
+                if let Some(preview) = self.workbench.base_preview() {
+                    edits.film_base = Some(stitch_domain::suggest_film_base(&preview.image));
+                    changed = true;
+                }
+            }
+            if edits.film_base.is_some() && ui.button("Clear").clicked() {
+                edits.film_base = None;
+                changed = true;
+            }
+        });
+        if self.picking_film_base {
+            ui.weak("Click the orange film base in the preview.");
+        }
+
+        changed |= ui
+            .add(egui::Slider::new(&mut edits.exposure, -6.0..=6.0).text("Exposure (EV)"))
+            .changed();
+        changed |= ui
+            .add(egui::Slider::new(&mut edits.contrast, -0.95..=0.95).text("Contrast"))
+            .changed();
+
+        egui::CollapsingHeader::new("Levels")
+            .default_open(false)
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.selectable_value(&mut self.level_channel, LevelChannel::Red, "R");
+                    ui.selectable_value(&mut self.level_channel, LevelChannel::Green, "G");
+                    ui.selectable_value(&mut self.level_channel, LevelChannel::Blue, "B");
+                    ui.selectable_value(&mut self.level_channel, LevelChannel::Gray, "Gray");
+                });
+                let levels = match self.level_channel {
+                    LevelChannel::Red => &mut edits.levels.red,
+                    LevelChannel::Green => &mut edits.levels.green,
+                    LevelChannel::Blue => &mut edits.levels.blue,
+                    LevelChannel::Gray => &mut edits.levels.gray,
+                };
+                changed |= ui
+                    .add(
+                        egui::Slider::new(&mut levels.black, 0.0..=0.9)
+                            .text("Black")
+                            .fixed_decimals(3),
+                    )
+                    .changed();
+                changed |= ui
+                    .add(
+                        egui::Slider::new(&mut levels.white, 0.1..=1.0)
+                            .text("White")
+                            .fixed_decimals(3),
+                    )
+                    .changed();
+                changed |= ui
+                    .add(egui::Slider::new(&mut levels.gamma, 0.1..=4.0).text("Gamma"))
+                    .changed();
+                ui.weak("Levels apply after inversion and exposure.");
+            });
+
+        if changed {
+            self.workbench.update_current_edits(edits.clone());
+        }
+
+        ui.separator();
+        ui.horizontal(|ui| {
+            if ui
+                .selectable_label(self.crop_mode, "Crop")
+                .on_hover_text("Drag a rectangle on the preview")
+                .clicked()
+            {
+                self.crop_mode = !self.crop_mode;
+                self.crop_start = None;
+                self.crop_end = None;
+                self.picking_film_base = false;
+            }
+            if edits.crop.is_some() && ui.button("Reset crop").clicked() {
+                edits.crop = None;
+                changed = true;
+            }
+        });
+        if let Some(crop) = edits.crop {
+            ui.weak(format!(
+                "Crop {} × {} at {}, {}",
+                crop.width, crop.height, crop.x, crop.y
+            ));
+        }
+        if self.crop_mode {
+            ui.weak("Drag a rectangle on the preview to crop.");
+        }
+        if changed {
+            self.workbench.update_current_edits(edits.clone());
+        }
+
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(
+                    self.workbench.project().len() > 1,
+                    egui::Button::new("Apply to all"),
+                )
+                .clicked()
+            {
+                self.workbench.apply_edits_to_all(edits.clone());
+            }
+            if ui.button("Reset").clicked() {
+                self.workbench.reset_current_edits();
+            }
+        });
+
+        let mut show = self.workbench.show_edits();
+        if ui.checkbox(&mut show, "Preview edits").changed() {
+            self.workbench.set_show_edits(show);
+        }
+    }
+
     fn status_bar(&mut self, ui: &mut egui::Ui) {
         let status = self.workbench.status().clone();
         ui.horizontal(|ui| match status {
@@ -611,7 +799,12 @@ impl ScanToImgApp {
     }
 
     fn preview_area(&mut self, ui: &mut egui::Ui) {
-        let Some(preview) = self.workbench.preview() else {
+        let preview = if self.crop_mode {
+            self.workbench.base_preview()
+        } else {
+            self.workbench.preview()
+        };
+        let Some(preview) = preview else {
             ui.centered_and_justified(|ui| {
                 ui.weak("Add images to start. Drag and drop works too.");
             });
@@ -634,6 +827,7 @@ impl ScanToImgApp {
             ui.label(&preview.label);
             if self.workbench.result().is_some() && ui.button("Show panorama").clicked() {
                 let _ = self.workbench.show_stitched();
+                self.picking_film_base = false;
             }
             ui.separator();
             if ui.button("−").clicked() {
@@ -673,7 +867,47 @@ impl ScanToImgApp {
         let center = viewport.center() + self.preview.pan;
         let image_rect = egui::Rect::from_center_size(center, display);
 
-        if response.dragged() {
+        if self.crop_mode {
+            if response.hovered() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+            }
+            if response.drag_started() {
+                self.crop_start = response
+                    .interact_pointer_pos()
+                    .filter(|position| image_rect.contains(*position));
+                self.crop_end = self.crop_start;
+            }
+            if response.dragged() && self.crop_start.is_some() {
+                self.crop_end = response.interact_pointer_pos().or(self.crop_end);
+            }
+            if let (Some(start), Some(end)) = (self.crop_start, self.crop_end) {
+                let rect = egui::Rect::from_two_pos(start, end).intersect(image_rect);
+                if rect.is_positive() {
+                    painter.rect_filled(rect, 0.0, egui::Color32::from_white_alpha(30));
+                    painter.rect_stroke(
+                        rect,
+                        0.0,
+                        egui::Stroke::new(2.0_f32, egui::Color32::from_rgb(255, 200, 60)),
+                        egui::StrokeKind::Inside,
+                    );
+                }
+            }
+            if response.drag_stopped() {
+                let start = self.crop_start.take();
+                let end = self
+                    .crop_end
+                    .take()
+                    .or_else(|| response.interact_pointer_pos());
+                if let (Some(start), Some(end)) = (start, end) {
+                    if let Some(crop) = crop_from_screen(&preview.image, start, end, image_rect) {
+                        let mut edits = self.workbench.current_edits();
+                        edits.crop = Some(crop);
+                        self.workbench.update_current_edits(edits);
+                        self.crop_mode = false;
+                    }
+                }
+            }
+        } else if response.dragged() {
             self.preview.pan += response.drag_delta();
         }
         if response.hovered() {
@@ -681,6 +915,42 @@ impl ScanToImgApp {
             if scroll.abs() > 0.0 {
                 let factor = (scroll * 0.002).exp();
                 self.preview.zoom = (self.preview.zoom * factor).clamp(0.1, 20.0);
+            }
+        }
+
+        if self.picking_film_base && !self.crop_mode && response.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+        }
+        if self.picking_film_base && !self.crop_mode && response.clicked() {
+            if let Some(position) = response.interact_pointer_pos() {
+                if image_rect.contains(position) {
+                    let normalized_x = (position.x - image_rect.left()) / image_rect.width();
+                    let normalized_y = (position.y - image_rect.top()) / image_rect.height();
+                    if let Some(base) = self.workbench.base_preview() {
+                        let settings = self.workbench.current_edits();
+                        let crop = settings
+                            .crop
+                            .filter(|_| self.workbench.show_edits())
+                            .and_then(|crop| crop.clamped(base.image.width(), base.image.height()));
+                        let (x, y) = match crop {
+                            Some(crop) => (
+                                crop.x as f32 + normalized_x * crop.width as f32,
+                                crop.y as f32 + normalized_y * crop.height as f32,
+                            ),
+                            None => (
+                                normalized_x * base.image.width() as f32,
+                                normalized_y * base.image.height() as f32,
+                            ),
+                        };
+                        let x = x.clamp(0.0, base.image.width().saturating_sub(1) as f32) as u32;
+                        let y = y.clamp(0.0, base.image.height().saturating_sub(1) as f32) as u32;
+                        let pixel = base.image.pixel(x, y);
+                        let mut edits = settings;
+                        edits.film_base = Some([pixel[0], pixel[1], pixel[2]]);
+                        self.workbench.update_current_edits(edits);
+                        self.picking_film_base = false;
+                    }
+                }
             }
         }
 
@@ -739,6 +1009,8 @@ impl eframe::App for ScanToImgApp {
             .default_size(320.0)
             .size_range(260.0..=460.0)
             .show(ui, |ui| {
+                self.develop(ui);
+                ui.separator();
                 if let Some(preview) = self.workbench.preview() {
                     self.histogram.update(&preview);
                     ui.heading("Histogram");
@@ -765,6 +1037,48 @@ impl eframe::App for ScanToImgApp {
             }
         });
     }
+}
+
+fn crop_from_screen(
+    image: &RgbaImage,
+    start: egui::Pos2,
+    end: egui::Pos2,
+    image_rect: egui::Rect,
+) -> Option<stitch_domain::CropRect> {
+    let to_image = |position: egui::Pos2| {
+        let x = ((position.x - image_rect.left()) / image_rect.width()).clamp(0.0, 1.0);
+        let y = ((position.y - image_rect.top()) / image_rect.height()).clamp(0.0, 1.0);
+        (x * image.width() as f32, y * image.height() as f32)
+    };
+    let (ax, ay) = to_image(start);
+    let (bx, by) = to_image(end);
+    let x = (ax.min(bx).round() as u32).min(image.width() - 1);
+    let y = (ay.min(by).round() as u32).min(image.height() - 1);
+    let width = ((ax - bx).abs().round() as u32).min(image.width() - x);
+    let height = ((ay - by).abs().round() as u32).min(image.height() - y);
+    (width >= 8 && height >= 8).then_some(stitch_domain::CropRect {
+        x,
+        y,
+        width,
+        height,
+    })
+}
+
+fn draw_swatch(ui: &mut egui::Ui, color: [u8; 3]) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::hover());
+    let painter = ui.painter();
+    painter.rect_filled(
+        rect,
+        2.0,
+        egui::Color32::from_rgb(color[0], color[1], color[2]),
+    );
+    painter.rect_stroke(
+        rect,
+        2.0,
+        egui::Stroke::new(1.0_f32, egui::Color32::from_gray(140)),
+        egui::StrokeKind::Inside,
+    );
+    ui.label(format!("#{:02X}{:02X}{:02X}", color[0], color[1], color[2]));
 }
 
 fn fit_size(texture: egui::Vec2, bounds: egui::Vec2) -> egui::Vec2 {

@@ -16,10 +16,11 @@ pub(crate) enum DialogMode {
     AddImages,
     OpenFolder,
     SaveImage,
+    SaveFolder,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum SaveFormat {
+pub(crate) enum SaveFormat {
     Png,
     Jpeg,
     Tiff,
@@ -30,7 +31,7 @@ enum SaveFormat {
 impl SaveFormat {
     const ALL: [Self; 5] = [Self::Png, Self::Jpeg, Self::Tiff, Self::WebP, Self::Bmp];
 
-    fn extension(self) -> &'static str {
+    pub(crate) fn extension(self) -> &'static str {
         match self {
             Self::Png => "png",
             Self::Jpeg => "jpg",
@@ -55,6 +56,7 @@ pub(crate) enum DialogOutcome {
     AddImages(Vec<PathBuf>),
     OpenFolder(PathBuf),
     SaveImage(PathBuf),
+    SaveFolder(PathBuf, SaveFormat),
 }
 
 struct Entry {
@@ -123,7 +125,8 @@ impl FileDialog {
         let title = match self.mode {
             DialogMode::AddImages => "Add images",
             DialogMode::OpenFolder => "Open folder",
-            DialogMode::SaveImage => "Export panorama",
+            DialogMode::SaveImage => "Export image",
+            DialogMode::SaveFolder => "Export all images",
         };
 
         let mut open = self.open;
@@ -283,6 +286,26 @@ impl FileDialog {
                     }
                     ui.weak("The original files are never overwritten.");
                 });
+            }
+            DialogMode::SaveFolder => {
+                ui.horizontal(|ui| {
+                    ui.label("Format");
+                    egui::ComboBox::from_id_salt("batch-format")
+                        .selected_text(self.format.label())
+                        .show_ui(ui, |ui| {
+                            for format in SaveFormat::ALL {
+                                ui.selectable_value(&mut self.format, format, format.label());
+                            }
+                        });
+                    if ui.button("Export all here").clicked() {
+                        *outcome =
+                            Some(DialogOutcome::SaveFolder(self.current.clone(), self.format));
+                    }
+                    if ui.button("Cancel").clicked() {
+                        self.open = false;
+                    }
+                });
+                ui.weak("Each image is written as <name>-edited.<format> next to the originals.");
             }
         }
     }

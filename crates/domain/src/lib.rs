@@ -12,6 +12,7 @@
 //!
 //! Nothing in this crate may depend on an adapter.
 
+pub mod edit;
 pub mod error;
 pub mod features;
 pub mod geometry;
@@ -20,6 +21,7 @@ pub mod ports;
 pub mod project;
 pub mod stitch;
 
+pub use edit::{suggest_film_base, ChannelLevels, CropRect, EditSettings, Levels};
 pub use error::{CoreError, CoreResult};
 pub use features::{Descriptor, Feature, FeatureMatch, FeatureSet, Keypoint};
 pub use geometry::{Homography, Point};

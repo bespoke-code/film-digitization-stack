@@ -163,6 +163,25 @@ impl RgbaImage {
         })
     }
 
+    /// Copies an axis-aligned rectangle, clamped to the image bounds.
+    pub fn cropped(&self, x: u32, y: u32, width: u32, height: u32) -> Self {
+        let x = x.min(self.width - 1);
+        let y = y.min(self.height - 1);
+        let width = width.min(self.width - x).max(1);
+        let height = height.min(self.height - y).max(1);
+        let mut pixels = Vec::with_capacity(width as usize * height as usize * 4);
+        for row in y..y + height {
+            let start = (row as usize * self.width as usize + x as usize) * 4;
+            let end = start + width as usize * 4;
+            pixels.extend_from_slice(&self.pixels[start..end]);
+        }
+        Self {
+            width,
+            height,
+            pixels,
+        }
+    }
+
     /// Downscales proportionally so that neither side exceeds `max_dimension`.
     /// Images that already fit are returned unchanged.
     pub fn resized_to_fit(&self, max_dimension: u32) -> Self {
