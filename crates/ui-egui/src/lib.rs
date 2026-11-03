@@ -11,7 +11,10 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread::JoinHandle;
 
-use dialog::{images_in_folder, is_supported_image, DialogMode, DialogOutcome, FileDialog};
+use dialog::{
+    folder_has_raw_images, images_in_folder, is_raw_image, is_supported_image, DialogMode,
+    DialogOutcome, FileDialog,
+};
 use eframe::egui;
 use stitch_application::{ProjectService, StitchService};
 use stitch_domain::{
@@ -365,16 +368,25 @@ impl ScanToImgApp {
 
     fn add_paths(&mut self, paths: Vec<PathBuf>) {
         let mut images = Vec::new();
+        let mut raw_files = 0usize;
         for path in paths {
             if path.is_dir() {
                 images.extend(images_in_folder(&path));
             } else if is_supported_image(&path) {
                 images.push(path);
+            } else if is_raw_image(&path) {
+                raw_files += 1;
             }
         }
         if images.is_empty() {
-            self.workbench
-                .notify("No supported images (PNG, JPEG, WebP, BMP, TIFF) were found.");
+            if raw_files > 0 {
+                self.workbench.notify(
+                    "RAW files are not supported yet. Convert them to TIFF, JPEG or PNG first.",
+                );
+            } else {
+                self.workbench
+                    .notify("No supported images (PNG, JPEG, WebP, BMP, TIFF) were found.");
+            }
             return;
         }
         let locators: Vec<ImageLocator> = images
@@ -430,10 +442,16 @@ impl ScanToImgApp {
             DialogOutcome::OpenFolder(folder) => {
                 let images = images_in_folder(&folder);
                 if images.is_empty() {
-                    self.workbench.fail_stitch(format!(
-                        "No supported images were found in {}.",
-                        folder.display()
-                    ));
+                    if folder_has_raw_images(&folder) {
+                        self.workbench.notify(
+                            "RAW files are not supported yet. Convert them to TIFF, JPEG or PNG first.",
+                        );
+                    } else {
+                        self.workbench.fail_stitch(format!(
+                            "No supported images were found in {}.",
+                            folder.display()
+                        ));
+                    }
                 } else {
                     self.add_paths(images);
                 }

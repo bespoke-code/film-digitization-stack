@@ -48,6 +48,9 @@ Pass image paths to open them at launch:
 
 Source files are never modified.
 
+RAW files are not decoded yet. Convert them to TIFF, JPEG or PNG before
+opening them in the app.
+
 ## Development
 
 ```sh

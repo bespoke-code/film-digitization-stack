@@ -11,6 +11,14 @@ use egui::{Context, RichText};
 
 pub(crate) const IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "webp", "bmp", "tif", "tiff"];
 
+/// Camera RAW extensions. They are listed here only to explain why they are
+/// skipped, because this build has no RAW decoder.
+pub(crate) const RAW_EXTENSIONS: &[&str] = &[
+    "3fr", "ari", "arw", "bay", "cr2", "cr3", "crw", "dcr", "dng", "erf", "fff", "iiq", "k25",
+    "kdc", "mef", "mos", "mrw", "nef", "nrw", "orf", "pef", "raf", "raw", "rw2", "rwl", "sr2",
+    "srf", "srw", "x3f",
+];
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum DialogMode {
     AddImages,
@@ -358,11 +366,29 @@ impl FileDialog {
 }
 
 pub(crate) fn is_supported_image(path: &Path) -> bool {
+    extension_in(path, IMAGE_EXTENSIONS)
+}
+
+pub(crate) fn is_raw_image(path: &Path) -> bool {
+    extension_in(path, RAW_EXTENSIONS)
+}
+
+fn extension_in(path: &Path, extensions: &[&str]) -> bool {
     path.extension()
         .and_then(|extension| extension.to_str())
         .map(|extension| {
             let extension = extension.to_ascii_lowercase();
-            IMAGE_EXTENSIONS.contains(&extension.as_str())
+            extensions.contains(&extension.as_str())
+        })
+        .unwrap_or(false)
+}
+
+pub(crate) fn folder_has_raw_images(path: &Path) -> bool {
+    std::fs::read_dir(path)
+        .map(|reader| {
+            reader
+                .flatten()
+                .any(|entry| entry.path().is_file() && is_raw_image(&entry.path()))
         })
         .unwrap_or(false)
 }
