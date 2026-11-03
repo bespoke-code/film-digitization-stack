@@ -80,6 +80,23 @@ impl StitchService {
         options: &StitchOptions,
         progress: &dyn ProgressSink,
     ) -> CoreResult<StitchResult> {
+        self.stitch_with_manual(images, &[], options, progress)
+    }
+
+    /// Runs the pipeline with rough placements as a fallback.
+    ///
+    /// `manual[i]` maps image `i` into the reference frame of image 0. The
+    /// service still tries automatic registration first. A manual placement is
+    /// used only when no pair produces an acceptable homography, which lets a
+    /// user align featureless scans without losing automatic corrections for
+    /// the rest.
+    pub fn stitch_with_manual(
+        &self,
+        images: &[SourceImage],
+        manual: &[Option<Homography>],
+        options: &StitchOptions,
+        progress: &dyn ProgressSink,
+    ) -> CoreResult<StitchResult> {
         if images.is_empty() {
             return Err(CoreError::EmptyProject);
         }
@@ -122,7 +139,7 @@ impl StitchService {
         ));
 
         let (transforms, gains, pairs) =
-            self.register(images, &analyses, &features, &options, progress)?;
+            self.register(images, &analyses, &features, manual, &options, progress)?;
 
         let transforms: Vec<Homography> = transforms
             .into_iter()
@@ -224,6 +241,7 @@ impl StitchService {
         images: &[SourceImage],
         analyses: &[AnalysisImage],
         features: &[FeatureSet],
+        manual: &[Option<Homography>],
         options: &StitchOptions,
         progress: &dyn ProgressSink,
     ) -> CoreResult<Registration> {
@@ -279,26 +297,43 @@ impl StitchService {
                 }
             }
 
-            let chosen =
-                best.ok_or_else(|| CoreError::NotEnoughOverlap(images[index].name.clone()))?;
+            if let Some(chosen) = best {
+                if let Some(diagnostic) = diagnostics.get_mut(chosen.diagnostic_index) {
+                    diagnostic.used_for_alignment = true;
+                }
 
-            if let Some(diagnostic) = diagnostics.get_mut(chosen.diagnostic_index) {
-                diagnostic.used_for_alignment = true;
+                let parent = transforms[chosen.target].as_ref().ok_or_else(|| {
+                    CoreError::Homography(format!(
+                        "{} was registered before its reference",
+                        images[chosen.target].name
+                    ))
+                })?;
+                transforms[index] = Some(parent.then(&chosen.homography));
+                let parent_gain = gains[chosen.target];
+                gains[index] = [
+                    parent_gain[0] * chosen.gain[0],
+                    parent_gain[1] * chosen.gain[1],
+                    parent_gain[2] * chosen.gain[2],
+                ];
+                continue;
             }
 
-            let parent = transforms[chosen.target].as_ref().ok_or_else(|| {
-                CoreError::Homography(format!(
-                    "{} was registered before its reference",
-                    images[chosen.target].name
-                ))
-            })?;
-            transforms[index] = Some(parent.then(&chosen.homography));
-            let parent_gain = gains[chosen.target];
-            gains[index] = [
-                parent_gain[0] * chosen.gain[0],
-                parent_gain[1] * chosen.gain[1],
-                parent_gain[2] * chosen.gain[2],
-            ];
+            let placement = manual
+                .get(index)
+                .copied()
+                .flatten()
+                .filter(Homography::is_finite)
+                .ok_or_else(|| CoreError::NotEnoughOverlap(images[index].name.clone()))?;
+            transforms[index] = Some(placement);
+            gains[index] = if options.normalize_colors {
+                estimate_gain(
+                    images[index].image.as_ref(),
+                    images[0].image.as_ref(),
+                    &placement,
+                )
+            } else {
+                [1.0; 3]
+            };
         }
 
         Ok((transforms, gains, diagnostics))

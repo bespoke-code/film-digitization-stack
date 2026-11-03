@@ -130,6 +130,62 @@ fn color_normalization_matches_exposure_between_frames() {
 }
 
 #[test]
+fn manual_placement_aligns_featureless_scans() {
+    let left = RgbaImage::filled(120, 80, [20, 20, 20, 255]);
+    let right = RgbaImage::filled(120, 80, [20, 20, 20, 255]);
+    let repository = Arc::new(InMemoryImageRepository::new());
+    repository.insert("left.png", left);
+    repository.insert("right.png", right);
+    let project_service = ProjectService::new(repository);
+    let mut workbench = Workbench::new();
+    workbench
+        .add_images(
+            &project_service,
+            &[
+                ImageLocator::new("left.png"),
+                ImageLocator::new("right.png"),
+            ],
+        )
+        .unwrap();
+    let right_id = workbench.project().images()[1].id;
+    workbench.set_manual_placement(right_id, stitch_domain::Homography::translation(60.0, 0.0));
+    workbench.stitch_sync(&production_service()).unwrap();
+    let result = workbench.result().unwrap();
+    assert_eq!((result.image.width(), result.image.height()), (180, 80));
+    assert_eq!(result.image.pixel(170, 40), [20, 20, 20, 255]);
+}
+
+#[test]
+fn automatic_registration_wins_over_a_rough_placement() {
+    let base = textured_rgba(760, 440, 21);
+    let left = crop(&base, 0, 480);
+    let right = crop(&base, 280, 480);
+
+    let repository = Arc::new(InMemoryImageRepository::new());
+    repository.insert("left.png", left);
+    repository.insert("right.png", right);
+    let project_service = ProjectService::new(repository);
+    let mut workbench = Workbench::new();
+    workbench
+        .add_images(
+            &project_service,
+            &[
+                ImageLocator::new("left.png"),
+                ImageLocator::new("right.png"),
+            ],
+        )
+        .unwrap();
+    let right_id = workbench.project().images()[1].id;
+    workbench.set_manual_placement(
+        right_id,
+        stitch_domain::Homography::translation(3000.0, 900.0),
+    );
+    workbench.stitch_sync(&production_service()).unwrap();
+    let result = workbench.result().unwrap();
+    assert_eq!((result.image.width(), result.image.height()), (760, 440));
+}
+
+#[test]
 fn handles_a_single_scan_without_stitching() {
     let repository = Arc::new(InMemoryImageRepository::new());
     repository.insert("single.png", textured_rgba(320, 240, 4));

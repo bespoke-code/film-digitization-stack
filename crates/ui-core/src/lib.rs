@@ -11,8 +11,9 @@ use std::sync::Arc;
 
 use stitch_application::{ProjectService, StitchService};
 use stitch_domain::{
-    suggest_film_base, CoreError, CoreResult, EditSettings, ImageId, ImageLocator, Project,
-    RgbaImage, SourceImage, StitchOptions, StitchProgress, StitchResult, StitchStage, MAX_IMAGES,
+    suggest_film_base, CoreError, CoreResult, EditSettings, Homography, ImageId, ImageLocator,
+    Project, RgbaImage, SourceImage, StitchOptions, StitchProgress, StitchResult, StitchStage,
+    MAX_IMAGES,
 };
 
 /// Longest side used for an edited preview.
@@ -66,6 +67,8 @@ pub struct PreviewInfo {
 pub struct StitchJob {
     pub images: Vec<SourceImage>,
     pub options: StitchOptions,
+    /// Rough source-to-reference placements used when automatic matching fails.
+    pub manual: Vec<Option<Homography>>,
     pub revision: u64,
 }
 
@@ -88,6 +91,7 @@ pub struct Workbench {
     status: WorkbenchStatus,
     edits: HashMap<ImageId, EditSettings>,
     result_edits: EditSettings,
+    manual: HashMap<ImageId, Homography>,
     show_edits: bool,
     preview_cache: RefCell<Option<PreviewCache>>,
 }
@@ -110,6 +114,7 @@ impl Workbench {
             status: WorkbenchStatus::Empty,
             edits: HashMap::new(),
             result_edits: EditSettings::default(),
+            manual: HashMap::new(),
             show_edits: true,
             preview_cache: RefCell::new(None),
         }
@@ -168,6 +173,39 @@ impl Workbench {
 
     pub fn edits(&self, id: ImageId) -> EditSettings {
         self.edits.get(&id).cloned().unwrap_or_default()
+    }
+
+    /// Rough placement of one image in the reference frame, when the user set it.
+    pub fn manual_placement(&self, id: ImageId) -> Option<Homography> {
+        self.manual.get(&id).copied()
+    }
+
+    /// Rough placements in project order. The reference image has no entry.
+    pub fn manual_placements(&self) -> Vec<Option<Homography>> {
+        self.project
+            .images()
+            .iter()
+            .enumerate()
+            .map(|(index, image)| {
+                if index == 0 {
+                    None
+                } else {
+                    self.manual.get(&image.id).copied()
+                }
+            })
+            .collect()
+    }
+
+    /// Stores a rough placement. Non-finite transforms are ignored.
+    pub fn set_manual_placement(&mut self, id: ImageId, homography: Homography) {
+        if self.project.get(id).is_none() || !homography.is_finite() {
+            return;
+        }
+        self.manual.insert(id, homography);
+    }
+
+    pub fn clear_manual_placements(&mut self) {
+        self.manual.clear();
     }
 
     pub fn current_edits(&self) -> EditSettings {
@@ -313,6 +351,7 @@ impl Workbench {
     pub fn remove_image(&mut self, id: ImageId) -> CoreResult<()> {
         self.project.remove(id)?;
         self.edits.remove(&id);
+        self.manual.clear();
         if self.selected == Some(id) {
             self.selected = self.project.images().first().map(|image| image.id);
         }
@@ -334,6 +373,7 @@ impl Workbench {
 
     pub fn move_up(&mut self, id: ImageId) -> CoreResult<()> {
         self.project.move_up(id)?;
+        self.manual.clear();
         self.invalidate_result();
         self.set_status(WorkbenchStatus::Ready("Image order updated.".to_owned()));
         Ok(())
@@ -341,6 +381,7 @@ impl Workbench {
 
     pub fn move_down(&mut self, id: ImageId) -> CoreResult<()> {
         self.project.move_down(id)?;
+        self.manual.clear();
         self.invalidate_result();
         self.set_status(WorkbenchStatus::Ready("Image order updated.".to_owned()));
         Ok(())
@@ -351,6 +392,7 @@ impl Workbench {
         self.selected = None;
         self.result = None;
         self.edits.clear();
+        self.manual.clear();
         self.result_edits = EditSettings::default();
         self.preview_target = PreviewTarget::Stitched;
         self.bump_revision();
@@ -424,6 +466,7 @@ impl Workbench {
         Ok(StitchJob {
             images: self.project.images().to_vec(),
             options: self.options.clone(),
+            manual: self.manual_placements(),
             revision: self.revision,
         })
     }
@@ -539,7 +582,12 @@ impl Workbench {
     /// integrations; the egui adapter uses [`Self::begin_stitch`] on a worker.
     pub fn stitch_sync(&mut self, service: &StitchService) -> CoreResult<()> {
         let job = self.begin_stitch()?;
-        match service.stitch(&job.images, &job.options, &stitch_domain::NoProgress) {
+        match service.stitch_with_manual(
+            &job.images,
+            &job.manual,
+            &job.options,
+            &stitch_domain::NoProgress,
+        ) {
             Ok(result) => {
                 self.finish_stitch(result);
                 Ok(())
@@ -796,5 +844,21 @@ mod tests {
         assert!(workbench.begin_stitch().is_err());
         workbench.fail_stitch("cancelled");
         assert!(!workbench.is_busy());
+    }
+
+    #[test]
+    fn rough_placements_travel_with_the_job() {
+        let repo = repo_with(2);
+        let mut workbench = Workbench::new();
+        add(&mut workbench, &repo, 2);
+        let second = workbench.project().images()[1].id;
+        let placement = Homography::translation(12.0, 4.0);
+        workbench.set_manual_placement(second, placement);
+        let job = workbench.begin_stitch().unwrap();
+        assert_eq!(job.manual, vec![None, Some(placement)]);
+        workbench.fail_stitch("cancelled");
+
+        workbench.move_down(second).unwrap();
+        assert_eq!(workbench.manual_placements(), vec![None, None]);
     }
 }

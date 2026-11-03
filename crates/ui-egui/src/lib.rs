@@ -15,8 +15,8 @@ use dialog::{images_in_folder, is_supported_image, DialogMode, DialogOutcome, Fi
 use eframe::egui;
 use stitch_application::{ProjectService, StitchService};
 use stitch_domain::{
-    CoreResult, CurvePoint, EditSettings, ImageId, ImageLocator, RgbaImage, SourceImage,
-    StitchOptions, StitchProgress, StitchResult, ToneCurve,
+    CoreResult, CurvePoint, EditSettings, Homography, ImageId, ImageLocator, RgbaImage,
+    SourceImage, StitchOptions, StitchProgress, StitchResult, ToneCurve,
 };
 use stitch_renderer_wgpu::PreviewRenderer;
 use stitch_ui_core::{PreviewInfo, PreviewTarget, Workbench, WorkbenchStatus};
@@ -170,6 +170,62 @@ enum LevelChannel {
     Gray,
 }
 
+/// Default horizontal overlap when a rough layout starts.
+const ARRANGE_OVERLAP: f32 = 0.15;
+
+struct ArrangeItem {
+    id: ImageId,
+    name: String,
+    /// Top-left corner in reference-image pixels.
+    position: egui::Vec2,
+    /// Source image size in pixels.
+    size: egui::Vec2,
+    texture: egui::TextureHandle,
+}
+
+struct ArrangeState {
+    items: Vec<ArrangeItem>,
+    scale: f32,
+    scene: egui::Rect,
+    drag: Option<usize>,
+}
+
+#[derive(Default)]
+struct ArrangeAction {
+    reset: bool,
+    confirm: bool,
+}
+
+impl ArrangeState {
+    fn reset_layout(&mut self) {
+        self.drag = None;
+        let first_height = self.items.first().map(|item| item.size.y).unwrap_or(0.0);
+        let mut cursor = 0.0;
+        for item in &mut self.items {
+            let y = ((first_height - item.size.y) * 0.5).max(0.0);
+            item.position = egui::vec2(cursor, y);
+            cursor = item.position.x + item.size.x * (1.0 - ARRANGE_OVERLAP);
+        }
+        self.rebuild_scene();
+    }
+
+    fn rebuild_scene(&mut self) {
+        let mut bounds = egui::Rect::NOTHING;
+        for item in &self.items {
+            let rect =
+                egui::Rect::from_min_size(egui::pos2(item.position.x, item.position.y), item.size);
+            bounds = bounds.union(rect);
+        }
+        if !bounds.is_positive() {
+            bounds = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1.0, 1.0));
+        }
+        self.scene = bounds.expand2(egui::vec2(
+            bounds.width() * 0.25 + 200.0,
+            bounds.height() * 0.25 + 200.0,
+        ));
+    }
+}
+
 /// The egui application shell.
 pub struct ScanToImgApp {
     workbench: Workbench,
@@ -190,6 +246,8 @@ pub struct ScanToImgApp {
     crop_mode: bool,
     crop_start: Option<egui::Pos2>,
     crop_end: Option<egui::Pos2>,
+    arrange_open: bool,
+    arrange: Option<ArrangeState>,
 }
 
 impl ScanToImgApp {
@@ -228,6 +286,8 @@ impl ScanToImgApp {
             crop_mode: false,
             crop_start: None,
             crop_end: None,
+            arrange_open: false,
+            arrange: None,
         }
     }
 
@@ -292,7 +352,8 @@ impl ScanToImgApp {
                 let _ = progress_sender.send(WorkerEvent::Progress(progress));
                 progress_context.request_repaint();
             };
-            let result = service.stitch(&job.images, &job.options, &progress);
+            let result =
+                service.stitch_with_manual(&job.images, &job.manual, &job.options, &progress);
             let _ = sender.send(WorkerEvent::Done(Box::new(result)));
             finish_context.request_repaint();
         });
@@ -322,6 +383,9 @@ impl ScanToImgApp {
             .collect();
         if let Err(error) = self.workbench.add_images(&self.project_service, &locators) {
             self.workbench.fail_stitch(error.to_string());
+        } else {
+            self.arrange = None;
+            self.arrange_open = false;
         }
     }
 
@@ -329,6 +393,9 @@ impl ScanToImgApp {
         if let Some(id) = self.workbench.selected() {
             if let Err(error) = self.workbench.remove_image(id) {
                 self.workbench.fail_stitch(error.to_string());
+            } else {
+                self.arrange = None;
+                self.arrange_open = false;
             }
         }
     }
@@ -473,6 +540,15 @@ impl ScanToImgApp {
                 self.start_stitch(ctx);
             }
             if ui
+                .add_enabled(
+                    self.workbench.project().len() > 1 && !self.workbench.is_busy(),
+                    egui::Button::new("Rough arrange…"),
+                )
+                .clicked()
+            {
+                self.open_arrange(ctx);
+            }
+            if ui
                 .add_enabled(self.workbench.can_export(), egui::Button::new("Export…"))
                 .clicked()
             {
@@ -498,6 +574,8 @@ impl ScanToImgApp {
             if ui.button("Clear").clicked() {
                 self.workbench.clear();
                 self.thumbnails.clear();
+                self.arrange = None;
+                self.arrange_open = false;
             }
         });
     }
@@ -739,6 +817,103 @@ impl ScanToImgApp {
         let mut show = self.workbench.show_edits();
         if ui.checkbox(&mut show, "Preview edits").changed() {
             self.workbench.set_show_edits(show);
+        }
+    }
+
+    fn open_arrange(&mut self, ctx: &egui::Context) {
+        let images = self.workbench.project().images().to_vec();
+        if images.len() < 2 {
+            self.workbench
+                .notify("Add at least two images before arranging them.");
+            return;
+        }
+        let manual = self.workbench.manual_placements();
+        let first_height = images[0].image.height() as f32;
+        let mut cursor = 0.0f32;
+        let mut items = Vec::with_capacity(images.len());
+        for (index, image) in images.iter().enumerate() {
+            let size = egui::vec2(image.image.width() as f32, image.image.height() as f32);
+            let position = match manual.get(index).copied().flatten() {
+                Some(placement) => egui::vec2(placement.m[2] as f32, placement.m[5] as f32),
+                None => egui::vec2(cursor, ((first_height - size.y) * 0.5).max(0.0)),
+            };
+            cursor = position.x + size.x * (1.0 - ARRANGE_OVERLAP);
+            items.push(ArrangeItem {
+                id: image.id,
+                name: image.name.clone(),
+                position,
+                size,
+                texture: self.thumbnail(ctx, image),
+            });
+        }
+        let max_side = images
+            .iter()
+            .map(|image| image.image.width().max(image.image.height()))
+            .max()
+            .unwrap_or(1) as f32;
+        let scale = (320.0 / max_side).clamp(0.01, 1.0);
+        let mut state = ArrangeState {
+            items,
+            scale,
+            scene: egui::Rect::NOTHING,
+            drag: None,
+        };
+        state.rebuild_scene();
+        self.arrange = Some(state);
+        self.arrange_open = true;
+    }
+
+    fn apply_arrangement(&mut self, ctx: &egui::Context) {
+        let Some(state) = self.arrange.take() else {
+            return;
+        };
+        self.workbench.clear_manual_placements();
+        for item in state.items.iter().skip(1) {
+            self.workbench.set_manual_placement(
+                item.id,
+                Homography::translation(item.position.x as f64, item.position.y as f64),
+            );
+        }
+        self.arrange_open = false;
+        self.start_stitch(ctx);
+    }
+
+    fn arrange_window(&mut self, ctx: &egui::Context) {
+        if !self.arrange_open {
+            return;
+        }
+        let mut open = true;
+        let mut action = ArrangeAction::default();
+        egui::Window::new("Rough arrange")
+            .open(&mut open)
+            .default_size(egui::vec2(860.0, 580.0))
+            .resizable(true)
+            .show(ctx, |ui| {
+                ui.weak(
+                    "Drag frames until the overlap looks right. Frame 1 is the reference and stays fixed. \
+                     The stitcher still refines every frame automatically and uses these placements only when no match is found.",
+                );
+                ui.horizontal(|ui| {
+                    if ui.button("Reset layout").clicked() {
+                        action.reset = true;
+                    }
+                    if ui.button("Apply and stitch").clicked() {
+                        action.confirm = true;
+                    }
+                });
+                ui.separator();
+                if let Some(state) = self.arrange.as_mut() {
+                    if action.reset {
+                        state.reset_layout();
+                    }
+                    draw_arrange(ui, state);
+                }
+            });
+        self.arrange_open = open && !action.confirm;
+        if action.confirm {
+            self.apply_arrangement(ctx);
+        } else if !self.arrange_open {
+            self.arrange = None;
         }
     }
 
@@ -1046,6 +1221,7 @@ impl eframe::App for ScanToImgApp {
             self.handle_dialog_outcome(outcome);
         }
         self.tone_window(&ctx);
+        self.arrange_window(&ctx);
 
         egui::Panel::top("toolbar").show(ui, |ui| {
             self.toolbar(&ctx, ui);
@@ -1093,6 +1269,87 @@ impl eframe::App for ScanToImgApp {
             }
         });
     }
+}
+
+fn draw_arrange(ui: &mut egui::Ui, state: &mut ArrangeState) {
+    let viewport = ui.available_size();
+    let scale = state.scale;
+    let scene = state.scene;
+    let desired = egui::vec2(
+        (scene.width() * scale).max(viewport.x.max(320.0)),
+        (scene.height() * scale).max(viewport.y.max(320.0)),
+    );
+    egui::ScrollArea::both()
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            let (response, painter) = ui.allocate_painter(desired, egui::Sense::hover());
+            let canvas = response.rect;
+            painter.rect_filled(canvas, 0.0, egui::Color32::from_gray(22));
+            let scene_px = scene.size() * scale;
+            let origin =
+                canvas.min + ((canvas.size() - scene_px) * 0.5) - scene.min.to_vec2() * scale;
+
+            for index in 0..state.items.len() {
+                let (id, position, size) = {
+                    let item = &state.items[index];
+                    (item.id, item.position, item.size)
+                };
+                let rect = egui::Rect::from_min_size(origin + position * scale, size * scale);
+                let sense = if index == 0 {
+                    egui::Sense::hover()
+                } else {
+                    egui::Sense::click_and_drag()
+                };
+                let interaction =
+                    ui.interact(rect, ui.scope_id().with(("arrange-frame", id.0)), sense);
+                if index > 0 {
+                    if interaction.drag_started() {
+                        state.drag = Some(index);
+                    }
+                    if interaction.dragged() && state.drag == Some(index) {
+                        state.items[index].position += interaction.drag_delta() / scale;
+                    }
+                    if interaction.drag_stopped() && state.drag == Some(index) {
+                        state.drag = None;
+                    }
+                    if interaction.hovered() {
+                        ui.ctx().set_cursor_icon(if interaction.dragged() {
+                            egui::CursorIcon::Grabbing
+                        } else {
+                            egui::CursorIcon::Grab
+                        });
+                    }
+                }
+
+                let item = &state.items[index];
+                painter.image(
+                    item.texture.id(),
+                    rect,
+                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                    egui::Color32::WHITE,
+                );
+                let stroke = if state.drag == Some(index) {
+                    egui::Stroke::new(2.0_f32, egui::Color32::from_rgb(255, 200, 60))
+                } else if index == 0 {
+                    egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(90, 170, 240))
+                } else {
+                    egui::Stroke::new(1.0_f32, egui::Color32::from_gray(120))
+                };
+                painter.rect_stroke(rect, 2.0, stroke, egui::StrokeKind::Inside);
+                let caption = if index == 0 {
+                    format!("1 · {} · reference", item.name)
+                } else {
+                    format!("{} · {}", index + 1, item.name)
+                };
+                painter.text(
+                    rect.left_top() + egui::vec2(5.0, 4.0),
+                    egui::Align2::LEFT_TOP,
+                    caption,
+                    egui::FontId::proportional(12.0),
+                    egui::Color32::WHITE,
+                );
+            }
+        });
 }
 
 fn curve_to_screen(point: CurvePoint, rect: egui::Rect) -> egui::Pos2 {
