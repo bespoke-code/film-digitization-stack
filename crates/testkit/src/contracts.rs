@@ -170,6 +170,7 @@ pub fn compositor_contract(compositor: &dyn Compositor) {
                 name: "single".to_owned(),
                 image: Arc::new(image.clone()),
                 homography: Homography::identity(),
+                gain: [1.0, 1.0, 1.0],
             }],
             &options,
         )
@@ -187,11 +188,13 @@ pub fn compositor_contract(compositor: &dyn Compositor) {
                     name: "red".to_owned(),
                     image: Arc::new(red),
                     homography: Homography::identity(),
+                    gain: [1.0, 1.0, 1.0],
                 },
                 WarpLayer {
                     name: "blue".to_owned(),
                     image: Arc::new(blue),
                     homography: Homography::translation(50.0, 0.0),
+                    gain: [1.0, 1.0, 1.0],
                 },
             ],
             &WarpOptions {

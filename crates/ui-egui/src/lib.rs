@@ -610,6 +610,10 @@ impl ScanToImgApp {
                 .text("Features per image"),
         );
         ui.add(egui::Slider::new(&mut self.options.feather_fraction, 0.0..=0.5).text("Feather"));
+        ui.checkbox(
+            &mut self.options.normalize_colors,
+            "Normalize color and exposure across frames",
+        );
         ui.add(
             egui::Slider::new(&mut self.options.max_canvas_dimension, 512..=16_384)
                 .text("Max canvas side (px)"),

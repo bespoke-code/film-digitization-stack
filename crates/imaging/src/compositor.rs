@@ -24,6 +24,7 @@ impl BilinearCompositor {
 struct PreparedLayer {
     image: Arc<RgbaImage>,
     inverse: Homography,
+    gain: [f32; 3],
     min_x: i64,
     min_y: i64,
     max_x: i64,
@@ -86,6 +87,7 @@ impl Compositor for BilinearCompositor {
             prepared.push(PreparedLayer {
                 image: layer.image.clone(),
                 inverse,
+                gain: layer.gain,
                 min_x,
                 min_y,
                 max_x,
@@ -128,9 +130,9 @@ impl Compositor for BilinearCompositor {
                             continue;
                         }
                         let base = x as usize * 3;
-                        rgb_row[base] += color[0] as f32 * weight;
-                        rgb_row[base + 1] += color[1] as f32 * weight;
-                        rgb_row[base + 2] += color[2] as f32 * weight;
+                        rgb_row[base] += color[0] as f32 * layer.gain[0] * weight;
+                        rgb_row[base + 1] += color[1] as f32 * layer.gain[1] * weight;
+                        rgb_row[base + 2] += color[2] as f32 * layer.gain[2] * weight;
                         weight_row[x as usize] += weight;
                     }
                 }
@@ -202,6 +204,7 @@ mod tests {
             name: "layer".to_owned(),
             image: Arc::new(image),
             homography: transform,
+            gain: [1.0, 1.0, 1.0],
         }
     }
 
@@ -270,5 +273,16 @@ mod tests {
     #[test]
     fn empty_layer_list_is_rejected() {
         assert!(BilinearCompositor.composite(&[], &options(10, 10)).is_err());
+    }
+
+    #[test]
+    fn layer_gain_scales_color_before_blending() {
+        let dim = RgbaImage::filled(4, 4, [100, 50, 25, 255]);
+        let mut warp = layer(dim, Homography::identity());
+        warp.gain = [2.0, 0.5, 1.0];
+        let output = BilinearCompositor
+            .composite(&[warp], &options(4, 4))
+            .unwrap();
+        assert_eq!(output.pixel(0, 0), [200, 25, 25, 255]);
     }
 }

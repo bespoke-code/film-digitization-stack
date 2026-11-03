@@ -28,6 +28,8 @@ pub struct StitchOptions {
     pub max_canvas_pixels: u64,
     /// Feather width as a fraction of the shorter image side.
     pub feather_fraction: f32,
+    /// Match the color balance of each layer to its reference image.
+    pub normalize_colors: bool,
 }
 
 impl Default for StitchOptions {
@@ -42,6 +44,7 @@ impl Default for StitchOptions {
             max_canvas_dimension: 12_000,
             max_canvas_pixels: 36_000_000,
             feather_fraction: 0.08,
+            normalize_colors: true,
         }
     }
 }
@@ -119,6 +122,8 @@ pub struct WarpLayer {
     pub image: Arc<RgbaImage>,
     /// Source image coordinates -> canvas coordinates.
     pub homography: Homography,
+    /// Per-channel multiplier applied before blending.
+    pub gain: [f32; 3],
 }
 
 /// Parameters passed to the compositor. The canvas size and layer transforms
@@ -202,6 +207,7 @@ mod tests {
             max_canvas_dimension: 0,
             max_canvas_pixels: 0,
             feather_fraction: 4.0,
+            normalize_colors: true,
         }
         .sanitized();
         assert!(options.max_analysis_dimension >= 320);

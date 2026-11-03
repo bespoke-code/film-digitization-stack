@@ -24,6 +24,18 @@ fn crop(image: &RgbaImage, x: u32, width: u32) -> RgbaImage {
     RgbaImage::from_fn(width, image.height(), |dx, y| image.pixel(x + dx, y))
 }
 
+fn scale(image: &RgbaImage, factor: f32) -> RgbaImage {
+    RgbaImage::from_fn(image.width(), image.height(), |x, y| {
+        let pixel = image.pixel(x, y);
+        [
+            (pixel[0] as f32 * factor).round().clamp(0.0, 255.0) as u8,
+            (pixel[1] as f32 * factor).round().clamp(0.0, 255.0) as u8,
+            (pixel[2] as f32 * factor).round().clamp(0.0, 255.0) as u8,
+            pixel[3],
+        ]
+    })
+}
+
 #[test]
 fn stitches_overlapping_scans_through_the_workbench() {
     let base = textured_rgba(760, 440, 21);
@@ -69,6 +81,52 @@ fn stitches_overlapping_scans_through_the_workbench() {
         repository.stored("panorama.png").unwrap().width(),
         result.image.width()
     );
+}
+
+#[test]
+fn color_normalization_matches_exposure_between_frames() {
+    let base = textured_rgba(760, 440, 21);
+    let left = crop(&base, 0, 480);
+    let right = scale(&crop(&base, 280, 480), 0.6);
+
+    let repository = Arc::new(InMemoryImageRepository::new());
+    repository.insert("left.png", left);
+    repository.insert("right.png", right);
+    let project_service = ProjectService::new(repository);
+    let mut workbench = Workbench::new();
+    workbench
+        .add_images(
+            &project_service,
+            &[
+                ImageLocator::new("left.png"),
+                ImageLocator::new("right.png"),
+            ],
+        )
+        .unwrap();
+    workbench.stitch_sync(&production_service()).unwrap();
+    let result = workbench.result().unwrap();
+
+    let mut output = [0u64; 3];
+    let mut expected = [0u64; 3];
+    let mut count = 0u64;
+    for y in 100..160 {
+        for x in 650..720 {
+            let actual = result.image.pixel(x, y);
+            let wanted = base.pixel(x, y);
+            for channel in 0..3 {
+                output[channel] += actual[channel] as u64;
+                expected[channel] += wanted[channel] as u64;
+            }
+            count += 1;
+        }
+    }
+    for channel in 0..3 {
+        let difference = (output[channel] as i64 - expected[channel] as i64).unsigned_abs() / count;
+        assert!(
+            difference <= 8,
+            "channel {channel} differs by {difference} levels"
+        );
+    }
 }
 
 #[test]

@@ -11,6 +11,7 @@ use stitch_domain::{
 };
 
 use crate::canvas::plan_canvas;
+use crate::color::estimate_gain;
 
 /// Wall-clock implementation of [`Clock`].
 #[derive(Clone, Copy, Debug, Default)]
@@ -120,7 +121,7 @@ impl StitchService {
             "Registering images",
         ));
 
-        let (transforms, pairs) =
+        let (transforms, gains, pairs) =
             self.register(images, &analyses, &features, &options, progress)?;
 
         let transforms: Vec<Homography> = transforms
@@ -131,7 +132,10 @@ impl StitchService {
             })
             .collect::<CoreResult<Vec<_>>>()?;
 
-        let plan = plan_canvas(images, &transforms, &options)?;
+        let mut plan = plan_canvas(images, &transforms, &options)?;
+        for (layer, gain) in plan.layers.iter_mut().zip(gains.iter()) {
+            layer.gain = *gain;
+        }
         progress.report(StitchProgress::new(
             StitchStage::Compositing,
             0,
@@ -222,9 +226,10 @@ impl StitchService {
         features: &[FeatureSet],
         options: &StitchOptions,
         progress: &dyn ProgressSink,
-    ) -> CoreResult<(Vec<Option<Homography>>, Vec<PairDiagnostics>)> {
+    ) -> CoreResult<Registration> {
         let mut transforms: Vec<Option<Homography>> = vec![None; images.len()];
         transforms[0] = Some(Homography::identity());
+        let mut gains = vec![[1.0f32; 3]; images.len()];
         let mut diagnostics = Vec::new();
 
         for index in 1..images.len() {
@@ -288,9 +293,15 @@ impl StitchService {
                 ))
             })?;
             transforms[index] = Some(parent.then(&chosen.homography));
+            let parent_gain = gains[chosen.target];
+            gains[index] = [
+                parent_gain[0] * chosen.gain[0],
+                parent_gain[1] * chosen.gain[1],
+                parent_gain[2] * chosen.gain[2],
+            ];
         }
 
-        Ok((transforms, diagnostics))
+        Ok((transforms, gains, diagnostics))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -358,9 +369,20 @@ impl StitchService {
         let homography =
             to_original_coordinates(&estimate, &analyses[query_index], &analyses[target_index])?;
 
+        let gain = if options.normalize_colors {
+            estimate_gain(
+                images[query_index].image.as_ref(),
+                images[target_index].image.as_ref(),
+                &homography,
+            )
+        } else {
+            [1.0; 3]
+        };
+
         Some(Candidate {
             target: target_index,
             homography,
+            gain,
             inliers: estimate.inliers.len(),
             diagnostic_index,
         })
@@ -374,9 +396,13 @@ struct AnalysisImage {
     features: FeatureSet,
 }
 
+/// Per-image transforms, color gains and pair diagnostics.
+type Registration = (Vec<Option<Homography>>, Vec<[f32; 3]>, Vec<PairDiagnostics>);
+
 struct Candidate {
     target: usize,
     homography: Homography,
+    gain: [f32; 3],
     inliers: usize,
     diagnostic_index: usize,
 }
