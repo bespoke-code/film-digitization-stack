@@ -826,9 +826,10 @@ impl ScanToImgApp {
         ui.horizontal(|ui| {
             if ui
                 .add_enabled(
-                    self.workbench.project().len() > 1,
+                    self.workbench.project().len() > 1 || self.workbench.result().is_some(),
                     egui::Button::new("Apply to all"),
                 )
+                .on_hover_text("Copy tone and color settings to every photo and the panorama")
                 .clicked()
             {
                 self.workbench.apply_edits_to_all(edits.clone());

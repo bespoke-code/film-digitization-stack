@@ -251,8 +251,13 @@ impl Workbench {
     }
 
     /// Copies the given adjustments to every loaded image for batch work.
+    ///
+    /// The crop is intentionally left alone because it is defined in each
+    /// image's own pixel coordinates. The stitched panorama receives the same
+    /// tone and color settings.
     pub fn apply_edits_to_all(&mut self, settings: EditSettings) {
-        let settings = settings.sanitized();
+        let mut settings = settings.sanitized();
+        settings.crop = None;
         let mut changed = false;
         for image in self.project.images() {
             if self.edits.get(&image.id) != Some(&settings) {
@@ -260,11 +265,22 @@ impl Workbench {
                 changed = true;
             }
         }
+        if self.result.is_some() && self.result_edits != settings {
+            self.result_edits = settings;
+            changed = true;
+        }
         if changed {
             self.bump_revision();
+            let panorama = if self.result.is_some() {
+                " and the panorama"
+            } else {
+                ""
+            };
             self.set_status(WorkbenchStatus::Ready(format!(
-                "Applied adjustments to {} images.",
-                self.project.len()
+                "Applied adjustments to {} image{}{}.",
+                self.project.len(),
+                if self.project.len() == 1 { "" } else { "s" },
+                panorama
             )));
         }
     }
@@ -787,6 +803,37 @@ mod tests {
         workbench.apply_edits_to_all(edits.clone());
         for image in workbench.project().images() {
             assert_eq!(workbench.edits(image.id), edits);
+        }
+    }
+
+    #[test]
+    fn batch_edits_reach_the_panorama_without_copying_crops() {
+        let repo = repo_with(2);
+        let mut workbench = Workbench::new();
+        add(&mut workbench, &repo, 2);
+        workbench.finish_stitch(StitchResult {
+            image: Arc::new(RgbaImage::filled(8, 8, [10, 20, 30, 255])),
+            placements: Vec::new(),
+            diagnostics: stitch_domain::StitchDiagnostics::default(),
+        });
+        let edits = EditSettings {
+            invert: true,
+            crop: Some(stitch_domain::CropRect {
+                x: 1,
+                y: 1,
+                width: 4,
+                height: 4,
+            }),
+            ..EditSettings::default()
+        };
+        workbench.apply_edits_to_all(edits);
+        workbench.show_stitched().unwrap();
+        let panorama = workbench.current_edits();
+        assert!(panorama.invert);
+        assert!(panorama.crop.is_none());
+        for image in workbench.project().images() {
+            assert!(workbench.edits(image.id).invert);
+            assert!(workbench.edits(image.id).crop.is_none());
         }
     }
 
