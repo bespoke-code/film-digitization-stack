@@ -529,8 +529,20 @@ impl Workbench {
                 .map(|pair| pair.num_inliers)
                 .sum::<usize>(),
         );
+        let size_changed = self.result.as_ref().is_some_and(|previous| {
+            previous.image.width() != result.image.width()
+                || previous.image.height() != result.image.height()
+        });
+        if self.result_edits.is_identity() {
+            if let Some(image) = self.project.images().first() {
+                let mut inherited = self.edits(image.id);
+                inherited.crop = None;
+                self.result_edits = inherited;
+            }
+        } else if size_changed {
+            self.result_edits.crop = None;
+        }
         self.result = Some(result);
-        self.result_edits = EditSettings::default();
         self.preview_target = PreviewTarget::Stitched;
         self.bump_revision();
         self.set_status(WorkbenchStatus::Ready(summary));
@@ -891,6 +903,54 @@ mod tests {
         assert!(workbench.begin_stitch().is_err());
         workbench.fail_stitch("cancelled");
         assert!(!workbench.is_busy());
+    }
+
+    #[test]
+    fn panorama_keeps_tone_edits_across_restitches() {
+        let repo = repo_with(1);
+        let mut workbench = Workbench::new();
+        add(&mut workbench, &repo, 1);
+        let id = workbench.selected().unwrap();
+        workbench.update_edits(
+            id,
+            EditSettings {
+                invert: true,
+                crop: Some(stitch_domain::CropRect {
+                    x: 1,
+                    y: 1,
+                    width: 4,
+                    height: 4,
+                }),
+                ..EditSettings::default()
+            },
+        );
+        let result = |width, height| StitchResult {
+            image: Arc::new(RgbaImage::filled(width, height, [10, 20, 30, 255])),
+            placements: Vec::new(),
+            diagnostics: stitch_domain::StitchDiagnostics::default(),
+        };
+        workbench.finish_stitch(result(8, 8));
+        let panorama = workbench.current_edits();
+        assert!(panorama.invert);
+        assert!(panorama.crop.is_none());
+
+        workbench.update_current_edits(EditSettings {
+            invert: true,
+            crop: Some(stitch_domain::CropRect {
+                x: 2,
+                y: 2,
+                width: 4,
+                height: 4,
+            }),
+            ..EditSettings::default()
+        });
+        workbench.finish_stitch(result(8, 8));
+        assert!(workbench.current_edits().crop.is_some());
+
+        workbench.finish_stitch(result(12, 8));
+        let panorama = workbench.current_edits();
+        assert!(panorama.invert);
+        assert!(panorama.crop.is_none());
     }
 
     #[test]
