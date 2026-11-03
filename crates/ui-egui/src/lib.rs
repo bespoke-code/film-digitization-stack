@@ -1055,6 +1055,14 @@ impl ScanToImgApp {
 
         ui.horizontal(|ui| {
             ui.label(&preview.label);
+            let showing_original = !self.workbench.show_edits();
+            if ui
+                .selectable_label(showing_original, "Original")
+                .on_hover_text("Show the unedited photo")
+                .clicked()
+            {
+                self.workbench.set_show_edits(showing_original);
+            }
             if self.workbench.result().is_some() && ui.button("Show panorama").clicked() {
                 let _ = self.workbench.show_stitched();
                 self.picking_film_base = false;
