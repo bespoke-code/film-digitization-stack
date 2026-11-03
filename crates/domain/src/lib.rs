@@ -21,7 +21,9 @@ pub mod ports;
 pub mod project;
 pub mod stitch;
 
-pub use edit::{suggest_film_base, ChannelLevels, CropRect, EditSettings, Levels};
+pub use edit::{
+    suggest_film_base, ChannelLevels, CropRect, CurvePoint, Curves, EditSettings, Levels, ToneCurve,
+};
 pub use error::{CoreError, CoreResult};
 pub use features::{Descriptor, Feature, FeatureMatch, FeatureSet, Keypoint};
 pub use geometry::{Homography, Point};

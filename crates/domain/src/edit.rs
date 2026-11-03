@@ -75,6 +75,177 @@ impl Levels {
     }
 }
 
+/// One control point on a tone curve in normalized input/output space.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CurvePoint {
+    pub x: f32,
+    pub y: f32,
+}
+
+/// A monotone tone curve built from sorted control points.
+///
+/// The identity curve has two points, `(0, 0)` and `(1, 1)`, so an unused curve
+/// costs nothing in the development lookup tables.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ToneCurve {
+    points: Vec<CurvePoint>,
+}
+
+impl Default for ToneCurve {
+    fn default() -> Self {
+        Self {
+            points: vec![CurvePoint { x: 0.0, y: 0.0 }, CurvePoint { x: 1.0, y: 1.0 }],
+        }
+    }
+}
+
+impl ToneCurve {
+    pub fn points(&self) -> &[CurvePoint] {
+        &self.points
+    }
+
+    /// Replaces the control points, clamping and sorting them into a valid
+    /// curve. Points that share an input value collapse into one.
+    pub fn set_points(&mut self, mut points: Vec<CurvePoint>) {
+        for point in &mut points {
+            point.x = point.x.clamp(0.0, 1.0);
+            point.y = point.y.clamp(0.0, 1.0);
+        }
+        points.sort_by(|a, b| a.x.total_cmp(&b.x));
+        points.dedup_by(|a, b| (a.x - b.x).abs() <= 1e-4);
+        if points.len() < 2 {
+            self.points = ToneCurve::default().points;
+        } else {
+            self.points = points;
+        }
+    }
+
+    pub fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    pub fn is_identity(&self) -> bool {
+        self.points.len() == 2
+            && self.points[0].x.abs() <= 1e-4
+            && self.points[0].y.abs() <= 1e-4
+            && (self.points[1].x - 1.0).abs() <= 1e-4
+            && (self.points[1].y - 1.0).abs() <= 1e-4
+    }
+
+    /// Evaluates the curve with monotone cubic Hermite interpolation.
+    pub fn evaluate(&self, x: f32) -> f32 {
+        let x = x.clamp(0.0, 1.0);
+        let points = &self.points;
+        let last = points.len() - 1;
+        if x <= points[0].x {
+            return points[0].y;
+        }
+        if x >= points[last].x {
+            return points[last].y;
+        }
+
+        let mut index = 0;
+        while index < last && x > points[index + 1].x {
+            index += 1;
+        }
+        let p0 = points[index];
+        let p1 = points[index + 1];
+        let h = p1.x - p0.x;
+        if h <= 1e-6 {
+            return p1.y;
+        }
+
+        let tangents = self.tangents();
+        let t = (x - p0.x) / h;
+        let t2 = t * t;
+        let t3 = t2 * t;
+        let h00 = 2.0 * t3 - 3.0 * t2 + 1.0;
+        let h10 = t3 - 2.0 * t2 + t;
+        let h01 = -2.0 * t3 + 3.0 * t2;
+        let h11 = t3 - t2;
+        let y = h00 * p0.y + h10 * h * tangents[index] + h01 * p1.y + h11 * h * tangents[index + 1];
+        y.clamp(0.0, 1.0)
+    }
+
+    /// Fritsch-Carlson tangents keep the interpolation monotone.
+    fn tangents(&self) -> Vec<f32> {
+        let points = &self.points;
+        let count = points.len();
+        let mut secants = Vec::with_capacity(count - 1);
+        for pair in points.windows(2) {
+            let dx = pair[1].x - pair[0].x;
+            let dy = pair[1].y - pair[0].y;
+            secants.push(if dx.abs() <= 1e-6 { 0.0 } else { dy / dx });
+        }
+        let mut tangents = vec![0.0; count];
+        tangents[0] = secants[0];
+        tangents[count - 1] = secants[count - 2];
+        for index in 1..count - 1 {
+            let left = secants[index - 1];
+            let right = secants[index];
+            tangents[index] = if left * right <= 0.0 {
+                0.0
+            } else {
+                (left + right) * 0.5
+            };
+        }
+        for index in 0..count - 1 {
+            let secant = secants[index];
+            if secant.abs() <= 1e-6 {
+                tangents[index] = 0.0;
+                tangents[index + 1] = 0.0;
+                continue;
+            }
+            let a = tangents[index] / secant;
+            let b = tangents[index + 1] / secant;
+            let sum = a * a + b * b;
+            if sum > 9.0 {
+                let scale = 3.0 / sum.sqrt();
+                tangents[index] = scale * a * secant;
+                tangents[index + 1] = scale * b * secant;
+            }
+        }
+        tangents
+    }
+}
+
+/// Tone curves for the RGB composite, each channel and the gray channel.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Curves {
+    pub rgb: ToneCurve,
+    pub red: ToneCurve,
+    pub green: ToneCurve,
+    pub blue: ToneCurve,
+    pub gray: ToneCurve,
+}
+
+impl Curves {
+    pub fn sanitized(mut self) -> Self {
+        self.rgb = self.rgb.sanitized();
+        self.red = self.red.sanitized();
+        self.green = self.green.sanitized();
+        self.blue = self.blue.sanitized();
+        self.gray = self.gray.sanitized();
+        self
+    }
+
+    fn is_identity(&self) -> bool {
+        self.rgb.is_identity()
+            && self.red.is_identity()
+            && self.green.is_identity()
+            && self.blue.is_identity()
+            && self.gray.is_identity()
+    }
+}
+
+impl ToneCurve {
+    fn sanitized(mut self) -> Self {
+        let points = std::mem::take(&mut self.points);
+        self.set_points(points);
+        self
+    }
+}
+
 /// Integer crop rectangle in source-image coordinates.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CropRect {
@@ -108,6 +279,7 @@ pub struct EditSettings {
     pub exposure: f32,
     pub contrast: f32,
     pub levels: Levels,
+    pub curves: Curves,
     pub crop: Option<CropRect>,
 }
 
@@ -120,6 +292,7 @@ impl Default for EditSettings {
             exposure: 0.0,
             contrast: 0.0,
             levels: Levels::default(),
+            curves: Curves::default(),
             crop: None,
         }
     }
@@ -130,6 +303,7 @@ impl EditSettings {
         self.exposure = self.exposure.clamp(-6.0, 6.0);
         self.contrast = self.contrast.clamp(-0.95, 0.95);
         self.levels = self.levels.sanitized();
+        self.curves = self.curves.sanitized();
         self
     }
 
@@ -140,6 +314,7 @@ impl EditSettings {
             && self.exposure.abs() <= f32::EPSILON
             && self.contrast.abs() <= f32::EPSILON
             && self.levels.is_identity()
+            && self.curves.is_identity()
             && self.crop.is_none()
     }
 
@@ -187,7 +362,7 @@ impl EditSettings {
             channel_lut(&settings, 1),
             channel_lut(&settings, 2),
         ];
-        let gray_lut = gray_lut(&settings.levels.gray);
+        let gray_lut = gray_lut(&settings.levels.gray, &settings.curves.gray);
         let mut pixels = image.pixels().to_vec();
         for chunk in pixels.as_chunks_mut::<4>().0 {
             let r = luts[0][chunk[0] as usize];
@@ -262,6 +437,11 @@ fn channel_lut(settings: &EditSettings, channel: usize) -> [u8; 256] {
         1 => settings.levels.green,
         _ => settings.levels.blue,
     };
+    let curve = match channel {
+        0 => &settings.curves.red,
+        1 => &settings.curves.green,
+        _ => &settings.curves.blue,
+    };
     let mut lut = [0u8; 256];
     for (value, slot) in lut.iter_mut().enumerate() {
         let mut normalized = value as f32 / 255.0;
@@ -274,16 +454,18 @@ fn channel_lut(settings: &EditSettings, channel: usize) -> [u8; 256] {
         normalized = (normalized - 0.5) * contrast + 0.5;
         normalized *= exposure;
         normalized = levels.apply(normalized);
+        normalized = curve.evaluate(normalized);
+        normalized = settings.curves.rgb.evaluate(normalized);
         *slot = (normalized.clamp(0.0, 1.0) * 255.0).round() as u8;
     }
     lut
 }
 
-fn gray_lut(levels: &ChannelLevels) -> [u8; 256] {
+fn gray_lut(levels: &ChannelLevels, curve: &ToneCurve) -> [u8; 256] {
     let mut lut = [0u8; 256];
     for (value, slot) in lut.iter_mut().enumerate() {
         let normalized = levels.apply(value as f32 / 255.0);
-        *slot = (normalized.clamp(0.0, 1.0) * 255.0).round() as u8;
+        *slot = (curve.evaluate(normalized).clamp(0.0, 1.0) * 255.0).round() as u8;
     }
     lut
 }
@@ -389,5 +571,69 @@ mod tests {
         let base = suggest_film_base(&image);
         assert!(base[0] > base[1] && base[1] > base[2]);
         assert!(base[0] >= 180);
+    }
+
+    #[test]
+    fn default_curve_is_identity() {
+        let curve = ToneCurve::default();
+        assert!(curve.is_identity());
+        for value in [0.0, 0.25, 0.5, 0.75, 1.0] {
+            assert!((curve.evaluate(value) - value).abs() < 1e-5);
+        }
+    }
+
+    #[test]
+    fn curve_inverts_values() {
+        let mut curve = ToneCurve::default();
+        curve.set_points(vec![
+            CurvePoint { x: 0.0, y: 1.0 },
+            CurvePoint { x: 1.0, y: 0.0 },
+        ]);
+        assert!((curve.evaluate(0.0) - 1.0).abs() < 1e-5);
+        assert!((curve.evaluate(1.0) - 0.0).abs() < 1e-5);
+        assert!((curve.evaluate(0.5) - 0.5).abs() < 1e-5);
+    }
+
+    #[test]
+    fn curve_midpoint_lifts_the_midtones() {
+        let mut curve = ToneCurve::default();
+        curve.set_points(vec![
+            CurvePoint { x: 0.0, y: 0.0 },
+            CurvePoint { x: 0.5, y: 0.75 },
+            CurvePoint { x: 1.0, y: 1.0 },
+        ]);
+        assert!((curve.evaluate(0.5) - 0.75).abs() < 1e-5);
+        assert!(curve.evaluate(0.25) > 0.25 && curve.evaluate(0.25) < 0.75);
+    }
+
+    #[test]
+    fn curve_points_are_sorted_and_clamped() {
+        let mut curve = ToneCurve::default();
+        curve.set_points(vec![
+            CurvePoint { x: 2.0, y: -1.0 },
+            CurvePoint { x: -1.0, y: 2.0 },
+            CurvePoint { x: 0.5, y: 0.5 },
+        ]);
+        let points = curve.points();
+        assert!(points.windows(2).all(|pair| pair[0].x <= pair[1].x));
+        assert!(points.iter().all(|point| (0.0..=1.0).contains(&point.x)));
+        assert!(points.iter().all(|point| (0.0..=1.0).contains(&point.y)));
+    }
+
+    #[test]
+    fn curve_changes_the_developed_pixel() {
+        let image = RgbaImage::filled(1, 1, [128, 128, 128, 255]);
+        let mut curves = Curves::default();
+        curves.rgb.set_points(vec![
+            CurvePoint { x: 0.0, y: 0.0 },
+            CurvePoint { x: 0.5, y: 0.9 },
+            CurvePoint { x: 1.0, y: 1.0 },
+        ]);
+        let settings = EditSettings {
+            curves,
+            ..EditSettings::default()
+        };
+        let pixel = settings.develop(&image).pixel(0, 0);
+        assert!(pixel[0] > 200);
     }
 }

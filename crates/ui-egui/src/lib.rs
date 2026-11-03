@@ -15,8 +15,8 @@ use dialog::{images_in_folder, is_supported_image, DialogMode, DialogOutcome, Fi
 use eframe::egui;
 use stitch_application::{ProjectService, StitchService};
 use stitch_domain::{
-    CoreResult, ImageId, ImageLocator, RgbaImage, SourceImage, StitchOptions, StitchProgress,
-    StitchResult,
+    CoreResult, CurvePoint, EditSettings, ImageId, ImageLocator, RgbaImage, SourceImage,
+    StitchOptions, StitchProgress, StitchResult, ToneCurve,
 };
 use stitch_renderer_wgpu::PreviewRenderer;
 use stitch_ui_core::{PreviewInfo, PreviewTarget, Workbench, WorkbenchStatus};
@@ -185,6 +185,8 @@ pub struct ScanToImgApp {
     pending_paths: Vec<PathBuf>,
     picking_film_base: bool,
     level_channel: LevelChannel,
+    tone_open: bool,
+    curve_drag: Option<usize>,
     crop_mode: bool,
     crop_start: Option<egui::Pos2>,
     crop_end: Option<egui::Pos2>,
@@ -221,6 +223,8 @@ impl ScanToImgApp {
             pending_paths,
             picking_film_base: false,
             level_channel: LevelChannel::Red,
+            tone_open: false,
+            curve_drag: None,
             crop_mode: false,
             crop_start: None,
             crop_end: None,
@@ -675,40 +679,9 @@ impl ScanToImgApp {
             .add(egui::Slider::new(&mut edits.contrast, -0.95..=0.95).text("Contrast"))
             .changed();
 
-        egui::CollapsingHeader::new("Levels")
-            .default_open(false)
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.selectable_value(&mut self.level_channel, LevelChannel::Red, "R");
-                    ui.selectable_value(&mut self.level_channel, LevelChannel::Green, "G");
-                    ui.selectable_value(&mut self.level_channel, LevelChannel::Blue, "B");
-                    ui.selectable_value(&mut self.level_channel, LevelChannel::Gray, "Gray");
-                });
-                let levels = match self.level_channel {
-                    LevelChannel::Red => &mut edits.levels.red,
-                    LevelChannel::Green => &mut edits.levels.green,
-                    LevelChannel::Blue => &mut edits.levels.blue,
-                    LevelChannel::Gray => &mut edits.levels.gray,
-                };
-                changed |= ui
-                    .add(
-                        egui::Slider::new(&mut levels.black, 0.0..=0.9)
-                            .text("Black")
-                            .fixed_decimals(3),
-                    )
-                    .changed();
-                changed |= ui
-                    .add(
-                        egui::Slider::new(&mut levels.white, 0.1..=1.0)
-                            .text("White")
-                            .fixed_decimals(3),
-                    )
-                    .changed();
-                changed |= ui
-                    .add(egui::Slider::new(&mut levels.gamma, 0.1..=4.0).text("Gamma"))
-                    .changed();
-                ui.weak("Levels apply after inversion and exposure.");
-            });
+        if ui.button("Levels & curves…").clicked() {
+            self.tone_open = true;
+        }
 
         if changed {
             self.workbench.update_current_edits(edits.clone());
@@ -763,6 +736,84 @@ impl ScanToImgApp {
         if ui.checkbox(&mut show, "Preview edits").changed() {
             self.workbench.set_show_edits(show);
         }
+    }
+
+    fn tone_window(&mut self, ctx: &egui::Context) {
+        if !self.tone_open {
+            return;
+        }
+        let mut open = self.tone_open;
+        let mut edits = self.workbench.current_edits();
+        let mut changed = false;
+        egui::Window::new("Levels & curves")
+            .open(&mut open)
+            .default_width(320.0)
+            .resizable(false)
+            .show(ctx, |ui| {
+                changed = self.tone_controls(ui, &mut edits);
+            });
+        self.tone_open = open;
+        if changed {
+            self.workbench.update_current_edits(edits);
+        }
+    }
+
+    fn tone_controls(&mut self, ui: &mut egui::Ui, edits: &mut EditSettings) -> bool {
+        let mut changed = false;
+        ui.horizontal(|ui| {
+            ui.selectable_value(&mut self.level_channel, LevelChannel::Red, "R");
+            ui.selectable_value(&mut self.level_channel, LevelChannel::Green, "G");
+            ui.selectable_value(&mut self.level_channel, LevelChannel::Blue, "B");
+            ui.selectable_value(&mut self.level_channel, LevelChannel::Gray, "Gray");
+        });
+
+        let levels = match self.level_channel {
+            LevelChannel::Red => &mut edits.levels.red,
+            LevelChannel::Green => &mut edits.levels.green,
+            LevelChannel::Blue => &mut edits.levels.blue,
+            LevelChannel::Gray => &mut edits.levels.gray,
+        };
+        changed |= ui
+            .add(
+                egui::Slider::new(&mut levels.black, 0.0..=0.9)
+                    .text("Black")
+                    .fixed_decimals(3),
+            )
+            .changed();
+        changed |= ui
+            .add(
+                egui::Slider::new(&mut levels.white, 0.1..=1.0)
+                    .text("White")
+                    .fixed_decimals(3),
+            )
+            .changed();
+        changed |= ui
+            .add(egui::Slider::new(&mut levels.gamma, 0.1..=4.0).text("Gamma"))
+            .changed();
+
+        let curve = match self.level_channel {
+            LevelChannel::Red => &mut edits.curves.red,
+            LevelChannel::Green => &mut edits.curves.green,
+            LevelChannel::Blue => &mut edits.curves.blue,
+            LevelChannel::Gray => &mut edits.curves.gray,
+        };
+        ui.separator();
+        ui.horizontal(|ui| {
+            ui.strong("Tone curve");
+            if ui.button("Reset curve").clicked() {
+                curve.reset();
+                changed = true;
+            }
+        });
+        let color = match self.level_channel {
+            LevelChannel::Red => egui::Color32::from_rgb(230, 90, 90),
+            LevelChannel::Green => egui::Color32::from_rgb(90, 220, 120),
+            LevelChannel::Blue => egui::Color32::from_rgb(100, 150, 240),
+            LevelChannel::Gray => egui::Color32::from_gray(210),
+        };
+        changed |= curve_editor(ui, curve, &mut self.curve_drag, color);
+        ui.weak("Click adds a point. Drag moves it. Right-click removes an inner point.");
+        changed
     }
 
     fn status_bar(&mut self, ui: &mut egui::Ui) {
@@ -990,6 +1041,7 @@ impl eframe::App for ScanToImgApp {
         if let Some(outcome) = self.dialog.show(&ctx) {
             self.handle_dialog_outcome(outcome);
         }
+        self.tone_window(&ctx);
 
         egui::Panel::top("toolbar").show(ui, |ui| {
             self.toolbar(&ctx, ui);
@@ -1037,6 +1089,169 @@ impl eframe::App for ScanToImgApp {
             }
         });
     }
+}
+
+fn curve_to_screen(point: CurvePoint, rect: egui::Rect) -> egui::Pos2 {
+    egui::pos2(
+        rect.left() + point.x * rect.width(),
+        rect.bottom() - point.y * rect.height(),
+    )
+}
+
+fn screen_to_curve(position: egui::Pos2, rect: egui::Rect) -> CurvePoint {
+    CurvePoint {
+        x: ((position.x - rect.left()) / rect.width()).clamp(0.0, 1.0),
+        y: ((rect.bottom() - position.y) / rect.height()).clamp(0.0, 1.0),
+    }
+}
+
+fn nearest_curve_point(
+    points: &[CurvePoint],
+    position: egui::Pos2,
+    rect: egui::Rect,
+) -> Option<usize> {
+    points
+        .iter()
+        .enumerate()
+        .map(|(index, point)| (index, curve_to_screen(*point, rect).distance(position)))
+        .filter(|(_, distance)| *distance <= 12.0)
+        .min_by(|a, b| a.1.total_cmp(&b.1))
+        .map(|(index, _)| index)
+}
+
+/// A square tone-curve editor with add, drag and remove interactions.
+fn curve_editor(
+    ui: &mut egui::Ui,
+    curve: &mut ToneCurve,
+    drag: &mut Option<usize>,
+    color: egui::Color32,
+) -> bool {
+    let side = ui.available_width().clamp(160.0, 280.0);
+    let (rect, response) =
+        ui.allocate_exact_size(egui::vec2(side, side), egui::Sense::click_and_drag());
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, 4.0, egui::Color32::from_gray(18));
+
+    for step in 0..=4 {
+        let t = step as f32 / 4.0;
+        let x = rect.left() + t * rect.width();
+        let y = rect.bottom() - t * rect.height();
+        let stroke = egui::Stroke::new(1.0_f32, egui::Color32::from_gray(38));
+        painter.line_segment(
+            [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
+            stroke,
+        );
+        painter.line_segment(
+            [egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)],
+            stroke,
+        );
+    }
+    painter.line_segment(
+        [
+            curve_to_screen(CurvePoint { x: 0.0, y: 0.0 }, rect),
+            curve_to_screen(CurvePoint { x: 1.0, y: 1.0 }, rect),
+        ],
+        egui::Stroke::new(1.0_f32, egui::Color32::from_gray(70)),
+    );
+
+    let mut points = curve.points().to_vec();
+    let mut changed = false;
+
+    if response.drag_started() {
+        if let Some(position) = response.interact_pointer_pos() {
+            match nearest_curve_point(&points, position, rect) {
+                Some(index) => *drag = Some(index),
+                None => {
+                    let point = screen_to_curve(position, rect);
+                    points.push(point);
+                    points.sort_by(|a, b| a.x.total_cmp(&b.x));
+                    *drag = points
+                        .iter()
+                        .position(|candidate| (candidate.x - point.x).abs() < 1e-6);
+                }
+            }
+            changed = true;
+        }
+    }
+
+    if response.dragged() {
+        if let (Some(index), Some(position)) = (*drag, response.interact_pointer_pos()) {
+            let mut updated = screen_to_curve(position, rect);
+            if index == 0 {
+                updated.x = 0.0;
+            } else if index + 1 == points.len() {
+                updated.x = 1.0;
+            } else {
+                let low = points[index - 1].x + 0.004;
+                let high = points[index + 1].x - 0.004;
+                updated.x = updated.x.clamp(low, high.max(low));
+            }
+            if let Some(point) = points.get_mut(index) {
+                *point = updated;
+                changed = true;
+            }
+        }
+    }
+    if response.drag_stopped() {
+        *drag = None;
+    }
+
+    if response.clicked() {
+        if let Some(position) = response.interact_pointer_pos() {
+            if nearest_curve_point(&points, position, rect).is_none() {
+                points.push(screen_to_curve(position, rect));
+                changed = true;
+            }
+        }
+    }
+    if response.secondary_clicked() {
+        if let Some(position) = response.interact_pointer_pos() {
+            if let Some(index) = nearest_curve_point(&points, position, rect) {
+                if index > 0 && index + 1 < points.len() {
+                    points.remove(index);
+                    *drag = None;
+                    changed = true;
+                }
+            }
+        }
+    }
+
+    if changed {
+        curve.set_points(points);
+    }
+
+    let samples: Vec<egui::Pos2> = (0..=128)
+        .map(|step| {
+            let x = step as f32 / 128.0;
+            curve_to_screen(
+                CurvePoint {
+                    x,
+                    y: curve.evaluate(x),
+                },
+                rect,
+            )
+        })
+        .collect();
+    painter.add(egui::Shape::line(
+        samples,
+        egui::Stroke::new(1.5_f32, color),
+    ));
+
+    for (index, point) in curve.points().iter().enumerate() {
+        let position = curve_to_screen(*point, rect);
+        let radius = if *drag == Some(index) { 6.0 } else { 4.5 };
+        painter.circle_filled(position, radius, color);
+        painter.circle_stroke(
+            position,
+            radius,
+            egui::Stroke::new(1.0_f32, egui::Color32::WHITE),
+        );
+    }
+
+    if response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+    }
+    changed
 }
 
 fn crop_from_screen(
