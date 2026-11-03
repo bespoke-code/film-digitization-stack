@@ -533,7 +533,10 @@ impl ScanToImgApp {
                 .clicked()
             {
                 if let Some(id) = self.workbench.selected() {
-                    let _ = self.workbench.move_up(id);
+                    if self.workbench.move_up(id).is_ok() {
+                        self.arrange = None;
+                        self.arrange_open = false;
+                    }
                 }
             }
             if ui
@@ -544,7 +547,10 @@ impl ScanToImgApp {
                 .clicked()
             {
                 if let Some(id) = self.workbench.selected() {
-                    let _ = self.workbench.move_down(id);
+                    if self.workbench.move_down(id).is_ok() {
+                        self.arrange = None;
+                        self.arrange_open = false;
+                    }
                 }
             }
             ui.separator();

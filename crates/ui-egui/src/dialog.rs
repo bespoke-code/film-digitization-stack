@@ -411,3 +411,27 @@ pub(crate) fn images_in_folder(path: &Path) -> Vec<PathBuf> {
     });
     images
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn separates_raw_from_supported_extensions() {
+        assert!(is_supported_image(Path::new("scan.JPG")));
+        assert!(is_supported_image(Path::new("scan.tiff")));
+        assert!(!is_supported_image(Path::new("scan.CR3")));
+        assert!(is_raw_image(Path::new("scan.CR3")));
+        assert!(is_raw_image(Path::new("scan.nef")));
+        assert!(!is_raw_image(Path::new("scan.png")));
+    }
+
+    #[test]
+    fn finds_raw_files_in_a_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("frame.CR2"), b"raw").unwrap();
+        assert!(folder_has_raw_images(dir.path()));
+        std::fs::write(dir.path().join("frame.png"), b"png").unwrap();
+        assert!(is_supported_image(&dir.path().join("frame.png")));
+    }
+}

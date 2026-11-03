@@ -16,5 +16,8 @@ egui-wgpu.workspace = true
 eframe.workspace = true
 log.workspace = true
 
+[dev-dependencies]
+tempfile.workspace = true
+
 [lints.rust]
 unsafe_code = "forbid"

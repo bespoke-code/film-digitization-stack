@@ -3135,6 +3135,7 @@ dependencies = [
  "stitch-domain",
  "stitch-renderer-wgpu",
  "stitch-ui-core",
+ "tempfile",
 ]
 
 [[package]]
