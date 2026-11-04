@@ -46,8 +46,9 @@ Pass image paths to open them at launch:
 3. If a pair has no usable detail, press **Rough arrange…**, then drag, rotate or
    scale the frames and apply. Row and Column give a fresh starting layout.
 4. Inspect the result in the zoomable preview and rotate the panorama if needed.
-5. Add camera, lens, film and exposure details in the **Metadata** pane. PNG, JPEG
-   and WebP exports embed them as EXIF; TIFF and BMP do not.
+5. Existing EXIF details appear automatically. Add or change camera, lens, film and
+   exposure details in the **Metadata** pane. PNG, JPEG and WebP exports embed them
+   as EXIF; TIFF and BMP do not.
 6. Export as PNG, JPEG, TIFF, WebP or BMP.
 
 Source files are never modified.

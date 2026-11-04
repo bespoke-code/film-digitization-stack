@@ -196,6 +196,7 @@ impl Project {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::metadata::PhotoMetadata;
 
     fn loaded(name: &str) -> LoadedImage {
         LoadedImage {
@@ -203,6 +204,7 @@ mod tests {
             name: name.to_owned(),
             thumbnail: RgbaImage::filled(4, 4, [0, 0, 0, 255]),
             image: RgbaImage::filled(8, 8, [0, 0, 0, 255]),
+            metadata: PhotoMetadata::default(),
         }
     }
 

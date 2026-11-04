@@ -16,6 +16,7 @@ pub struct LoadedImage {
     pub name: String,
     pub image: RgbaImage,
     pub thumbnail: RgbaImage,
+    pub metadata: PhotoMetadata,
 }
 
 /// Durable storage for source images and exported results.

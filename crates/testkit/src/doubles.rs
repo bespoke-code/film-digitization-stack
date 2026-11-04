@@ -37,6 +37,7 @@ impl InMemoryImageRepository {
                 name,
                 image,
                 thumbnail,
+                metadata: PhotoMetadata::default(),
             },
         );
     }
@@ -71,12 +72,17 @@ impl InMemoryImageRepository {
 
 impl ImageRepository for InMemoryImageRepository {
     fn load(&self, locator: &ImageLocator) -> CoreResult<LoadedImage> {
-        self.images
+        let mut loaded = self
+            .images
             .lock()
             .unwrap()
             .get(locator.as_str())
             .cloned()
-            .ok_or_else(|| CoreError::NotFound(locator.as_str().to_owned()))
+            .ok_or_else(|| CoreError::NotFound(locator.as_str().to_owned()))?;
+        if let Some(metadata) = self.metadata.lock().unwrap().get(locator.as_str()) {
+            loaded.metadata = metadata.clone();
+        }
+        Ok(loaded)
     }
 
     fn save(&self, locator: &ImageLocator, image: &RgbaImage) -> CoreResult<()> {
@@ -90,6 +96,7 @@ impl ImageRepository for InMemoryImageRepository {
                 name,
                 image: image.clone(),
                 thumbnail,
+                metadata: PhotoMetadata::default(),
             },
         );
         Ok(())

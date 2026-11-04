@@ -445,10 +445,12 @@ impl Workbench {
         if self.project.is_full() {
             return Err(CoreError::TooManyImages { max: MAX_IMAGES });
         }
-        let ids = service.add_images(&mut self.project, locators)?;
-        for &id in &ids {
+        let added = service.add_images_with_metadata(&mut self.project, locators)?;
+        let mut ids = Vec::with_capacity(added.len());
+        for (id, metadata) in added {
             self.edits.insert(id, EditSettings::default());
-            self.metadata.insert(id, PhotoMetadata::default());
+            self.metadata.insert(id, metadata);
+            ids.push(id);
         }
         if let Some(&id) = ids.first() {
             self.selected = Some(id);
@@ -840,6 +842,7 @@ mod tests {
                     name,
                     image: RgbaImage::filled(40, 30, [index as u8, 0, 0, 255]),
                     thumbnail: RgbaImage::filled(20, 15, [0, 0, 0, 255]),
+                    metadata: PhotoMetadata::default(),
                 },
             );
         }
@@ -1220,6 +1223,37 @@ mod tests {
         for image in workbench.project().images() {
             assert_eq!(workbench.image_metadata(image.id), metadata);
         }
+    }
+
+    #[test]
+    fn loaded_metadata_reaches_the_editor() {
+        let repo = Arc::new(MemoryRepo::default());
+        let name = "image-0.png".to_owned();
+        let metadata = PhotoMetadata {
+            camera: "Nikon FM2".to_owned(),
+            iso: "400".to_owned(),
+            ..PhotoMetadata::default()
+        };
+        repo.images.lock().unwrap().insert(
+            name.clone(),
+            LoadedImage {
+                locator: ImageLocator::new(name.clone()),
+                name,
+                image: RgbaImage::filled(40, 30, [1, 2, 3, 255]),
+                thumbnail: RgbaImage::filled(20, 15, [0, 0, 0, 255]),
+                metadata: metadata.clone(),
+            },
+        );
+
+        let mut workbench = Workbench::new();
+        let service = ProjectService::new(repo.clone());
+        workbench
+            .add_images(&service, &[ImageLocator::new("image-0.png")])
+            .unwrap();
+
+        let id = workbench.selected().unwrap();
+        assert_eq!(workbench.image_metadata(id), metadata);
+        assert_eq!(workbench.current_metadata(), metadata);
     }
 
     #[test]

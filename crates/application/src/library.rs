@@ -31,6 +31,16 @@ impl ProjectService {
         project: &mut Project,
         locators: &[ImageLocator],
     ) -> CoreResult<Vec<ImageId>> {
+        let added = self.add_images_with_metadata(project, locators)?;
+        Ok(added.into_iter().map(|(id, _)| id).collect())
+    }
+
+    /// Loads images and returns the metadata read from each file.
+    pub fn add_images_with_metadata(
+        &self,
+        project: &mut Project,
+        locators: &[ImageLocator],
+    ) -> CoreResult<Vec<(ImageId, PhotoMetadata)>> {
         if locators.is_empty() {
             return Ok(Vec::new());
         }
@@ -43,11 +53,13 @@ impl ProjectService {
             .map(|locator| self.repository.load(locator))
             .collect::<CoreResult<_>>()?;
 
-        let mut ids = Vec::with_capacity(loaded.len());
+        let mut added = Vec::with_capacity(loaded.len());
         for image in loaded {
-            ids.push(project.add_loaded(image)?);
+            let metadata = image.metadata.clone();
+            let id = project.add_loaded(image)?;
+            added.push((id, metadata));
         }
-        Ok(ids)
+        Ok(added)
     }
 
     pub fn export(&self, locator: &ImageLocator, image: &RgbaImage) -> CoreResult<()> {

@@ -8,7 +8,7 @@ use stitch_domain::{
     CoreError, CoreResult, ImageLocator, ImageRepository, LoadedImage, PhotoMetadata, RgbaImage,
 };
 
-use crate::metadata::embed_metadata;
+use crate::metadata::{embed_metadata, extract_metadata};
 
 /// Filesystem-backed [`ImageRepository`].
 #[derive(Clone, Debug)]
@@ -57,10 +57,15 @@ impl ImageRepository for FileImageRepository {
             });
         }
 
-        let decoded = image::open(path).map_err(|error| CoreError::Decode {
+        let bytes = std::fs::read(path).map_err(|error| CoreError::Io {
+            path: locator.as_str().to_owned(),
+            message: error.to_string(),
+        })?;
+        let decoded = image::load_from_memory(&bytes).map_err(|error| CoreError::Decode {
             name: locator.display_name(),
             message: error.to_string(),
         })?;
+        let metadata = extract_metadata(&bytes);
         let mut rgba = decoded.to_rgba8();
         if let Some(max_dimension) = self.max_dimension {
             let (width, height) = rgba.dimensions();
@@ -85,6 +90,7 @@ impl ImageRepository for FileImageRepository {
             name: locator.display_name(),
             image,
             thumbnail,
+            metadata,
         })
     }
 
@@ -217,6 +223,30 @@ mod tests {
         assert!(String::from_utf8_lossy(&bytes).contains("Nikon FM2"));
         let loaded = repository.load(&locator).unwrap();
         assert_eq!(loaded.image.width(), 24);
+        assert_eq!(loaded.metadata.camera, "Nikon FM2");
+        assert_eq!(loaded.metadata.film, "Kodak Portra 400");
+    }
+
+    #[test]
+    fn load_reads_metadata_from_jpeg_and_webp() {
+        for extension in ["jpg", "webp"] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join(format!("image.{extension}"));
+            let locator = ImageLocator::new(path.to_string_lossy());
+            let image = RgbaImage::filled(24, 16, [1, 2, 3, 255]);
+            let metadata = PhotoMetadata {
+                camera: "Nikon FM2".to_owned(),
+                iso: "400".to_owned(),
+                ..PhotoMetadata::default()
+            };
+            let repository = FileImageRepository::default();
+            repository
+                .save_with_metadata(&locator, &image, Some(&metadata))
+                .unwrap();
+            let loaded = repository.load(&locator).unwrap();
+            assert_eq!(loaded.metadata.camera, "Nikon FM2");
+            assert_eq!(loaded.metadata.iso, "400");
+        }
     }
 
     #[test]
