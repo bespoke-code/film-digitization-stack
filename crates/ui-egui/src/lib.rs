@@ -868,7 +868,7 @@ impl ScanToImgApp {
         ui.horizontal(|ui| {
             ui.label("Rotate");
             if ui
-                .button("⟲ 90°")
+                .button("Left 90°")
                 .on_hover_text("Rotate a quarter turn counter-clockwise")
                 .clicked()
             {
@@ -876,7 +876,7 @@ impl ScanToImgApp {
                 changed = true;
             }
             if ui
-                .button("⟳ 90°")
+                .button("Right 90°")
                 .on_hover_text("Rotate a quarter turn clockwise")
                 .clicked()
             {
@@ -1628,7 +1628,7 @@ fn arrange_frame_controls(ui: &mut egui::Ui, state: &mut ArrangeState) -> bool {
         ui.label(format!("Frame {} · {}", index + 1, item.name));
         ui.add_enabled_ui(!reference, |ui| {
             if ui
-                .button("⟲ 90°")
+                .button("Left 90°")
                 .on_hover_text("Rotate counter-clockwise")
                 .clicked()
             {
@@ -1636,7 +1636,7 @@ fn arrange_frame_controls(ui: &mut egui::Ui, state: &mut ArrangeState) -> bool {
                 changed = true;
             }
             if ui
-                .button("⟳ 90°")
+                .button("Right 90°")
                 .on_hover_text("Rotate clockwise")
                 .clicked()
             {
