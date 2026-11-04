@@ -199,18 +199,12 @@ impl FileDialog {
                 }
                 for entry in &self.entries {
                     if entry.is_dir {
-                        ui.horizontal(|ui| {
-                            if ui
-                                .add(egui::Button::new(format!("DIR  {}", entry.name)).frame(false))
-                                .clicked()
-                            {
-                                go_to = Some(entry.path.clone());
-                            }
-                        });
+                        if file_row(ui, true, &entry.name, false, true).clicked() {
+                            go_to = Some(entry.path.clone());
+                        }
                     } else if self.mode == DialogMode::AddImages {
                         let selected = self.selected.contains(&entry.path);
-                        let response =
-                            ui.selectable_label(selected, format!("IMG  {}", entry.name));
+                        let response = file_row(ui, false, &entry.name, selected, true);
                         if response.clicked() {
                             if selected {
                                 self.selected.remove(&entry.path);
@@ -222,7 +216,7 @@ impl FileDialog {
                             *outcome = Some(DialogOutcome::AddImages(vec![entry.path.clone()]));
                         }
                     } else {
-                        ui.weak(format!("IMG  {}", entry.name));
+                        file_row(ui, false, &entry.name, false, false);
                     }
                 }
             });
@@ -362,6 +356,86 @@ impl FileDialog {
                 .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
         });
         self.entries = entries;
+    }
+}
+
+fn file_row(
+    ui: &mut egui::Ui,
+    is_dir: bool,
+    name: &str,
+    selected: bool,
+    enabled: bool,
+) -> egui::Response {
+    let height = ui.spacing().interact_size.y.max(20.0);
+    let sense = if enabled {
+        egui::Sense::click()
+    } else {
+        egui::Sense::hover()
+    };
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(ui.available_width(), height), sense);
+    let visuals = ui.visuals().clone();
+    let painter = ui.painter();
+    if selected {
+        painter.rect_filled(rect, 2.0, visuals.selection.bg_fill);
+    } else if enabled && response.hovered() {
+        painter.rect_filled(rect, 2.0, visuals.widgets.hovered.bg_fill);
+    }
+    let icon_center = egui::pos2(rect.left() + 11.0, rect.center().y);
+    draw_file_icon(painter, icon_center, is_dir);
+    let color = if selected {
+        visuals.selection.stroke.color
+    } else if enabled {
+        visuals.text_color()
+    } else {
+        visuals.weak_text_color()
+    };
+    painter.text(
+        egui::pos2(rect.left() + 24.0, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        name,
+        egui::FontId::proportional(14.0),
+        color,
+    );
+    response
+}
+
+/// Draws a small folder or photo icon so rows look like a file browser.
+fn draw_file_icon(painter: &egui::Painter, center: egui::Pos2, is_dir: bool) {
+    if is_dir {
+        let tab = egui::Rect::from_min_size(center + egui::vec2(-7.0, -7.0), egui::vec2(7.0, 4.0));
+        let body =
+            egui::Rect::from_min_size(center + egui::vec2(-7.0, -4.0), egui::vec2(14.0, 10.0));
+        painter.rect_filled(tab, 1.0, egui::Color32::from_rgb(224, 184, 84));
+        painter.rect_filled(body, 1.5, egui::Color32::from_rgb(238, 198, 100));
+        painter.rect_stroke(
+            body,
+            1.5,
+            egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(150, 112, 36)),
+            egui::StrokeKind::Inside,
+        );
+    } else {
+        let frame = egui::Rect::from_center_size(center, egui::vec2(15.0, 12.0));
+        painter.rect_filled(frame, 1.5, egui::Color32::from_rgb(70, 112, 160));
+        painter.rect_stroke(
+            frame,
+            1.5,
+            egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(190, 210, 230)),
+            egui::StrokeKind::Inside,
+        );
+        painter.circle_filled(
+            frame.left_top() + egui::vec2(4.0, 3.5),
+            1.6,
+            egui::Color32::from_rgb(245, 240, 200),
+        );
+        painter.add(egui::Shape::convex_polygon(
+            vec![
+                frame.left_bottom() + egui::vec2(1.5, -1.5),
+                frame.left_bottom() + egui::vec2(6.0, -6.0),
+                frame.right_bottom() + egui::vec2(-1.5, -1.5),
+            ],
+            egui::Color32::from_rgb(225, 235, 245),
+            egui::Stroke::NONE,
+        ));
     }
 }
 

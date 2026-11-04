@@ -22,7 +22,8 @@ pub mod project;
 pub mod stitch;
 
 pub use edit::{
-    suggest_film_base, ChannelLevels, CropRect, CurvePoint, Curves, EditSettings, Levels, ToneCurve,
+    normalized_rotation, rotation_is_identity, suggest_film_base, ChannelLevels, CropRect,
+    CurvePoint, Curves, EditSettings, Levels, ToneCurve,
 };
 pub use error::{CoreError, CoreResult};
 pub use features::{Descriptor, Feature, FeatureMatch, FeatureSet, Keypoint};

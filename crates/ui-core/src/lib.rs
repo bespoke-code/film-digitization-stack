@@ -69,6 +69,8 @@ pub struct StitchJob {
     pub options: StitchOptions,
     /// Rough source-to-reference placements used when automatic matching fails.
     pub manual: Vec<Option<Homography>>,
+    /// Clockwise rotation per image, in degrees.
+    pub rotations: Vec<f32>,
     pub revision: u64,
 }
 
@@ -148,9 +150,15 @@ impl Workbench {
         self.revision
     }
 
-    /// The unedited image currently selected for preview.
+    /// The unedited image currently selected for preview, with rotation applied.
     pub fn base_preview(&self) -> Option<PreviewInfo> {
         let (image, label) = self.base_image()?;
+        let rotation = self.current_edits().rotation;
+        let image = if stitch_domain::rotation_is_identity(rotation) {
+            image
+        } else {
+            Arc::new(image.rotated(rotation))
+        };
         Some(PreviewInfo {
             image,
             label,
@@ -231,8 +239,20 @@ impl Workbench {
             return;
         }
         let settings = settings.sanitized();
+        let rotation_changed = self
+            .edits
+            .get(&id)
+            .map(|current| (current.rotation - settings.rotation).abs() > f32::EPSILON)
+            .unwrap_or(settings.rotation != 0.0);
         if self.edits.get(&id) != Some(&settings) {
             self.edits.insert(id, settings);
+            if rotation_changed {
+                if self.project.position(id) == Some(0) {
+                    self.manual.clear();
+                } else {
+                    self.manual.remove(&id);
+                }
+            }
             self.bump_revision();
         }
     }
@@ -260,14 +280,24 @@ impl Workbench {
         settings.crop = None;
         let mut changed = false;
         for image in self.project.images() {
-            if self.edits.get(&image.id) != Some(&settings) {
-                self.edits.insert(image.id, settings.clone());
+            let mut target = settings.clone();
+            target.rotation = self
+                .edits
+                .get(&image.id)
+                .map(|current| current.rotation)
+                .unwrap_or(0.0);
+            if self.edits.get(&image.id) != Some(&target) {
+                self.edits.insert(image.id, target);
                 changed = true;
             }
         }
-        if self.result.is_some() && self.result_edits != settings {
-            self.result_edits = settings;
-            changed = true;
+        if self.result.is_some() {
+            let mut target = settings.clone();
+            target.rotation = self.result_edits.rotation;
+            if self.result_edits != target {
+                self.result_edits = target;
+                changed = true;
+            }
         }
         if changed {
             self.bump_revision();
@@ -483,6 +513,12 @@ impl Workbench {
             images: self.project.images().to_vec(),
             options: self.options.clone(),
             manual: self.manual_placements(),
+            rotations: self
+                .project
+                .images()
+                .iter()
+                .map(|image| self.edits(image.id).rotation)
+                .collect(),
             revision: self.revision,
         })
     }
@@ -537,6 +573,7 @@ impl Workbench {
             if let Some(image) = self.project.images().first() {
                 let mut inherited = self.edits(image.id);
                 inherited.crop = None;
+                inherited.rotation = 0.0;
                 self.result_edits = inherited;
             }
         } else if size_changed {
@@ -610,8 +647,9 @@ impl Workbench {
     /// integrations; the egui adapter uses [`Self::begin_stitch`] on a worker.
     pub fn stitch_sync(&mut self, service: &StitchService) -> CoreResult<()> {
         let job = self.begin_stitch()?;
-        match service.stitch_with_manual(
+        match service.stitch_with_rotations(
             &job.images,
+            &job.rotations,
             &job.manual,
             &job.options,
             &stitch_domain::NoProgress,
@@ -967,5 +1005,97 @@ mod tests {
 
         workbench.move_down(second).unwrap();
         assert_eq!(workbench.manual_placements(), vec![None, None]);
+    }
+
+    #[test]
+    fn rotation_reaches_the_job_and_the_base_preview() {
+        let repo = repo_with(2);
+        let mut workbench = Workbench::new();
+        add(&mut workbench, &repo, 2);
+        let first = workbench.project().images()[0].id;
+        workbench.update_edits(
+            first,
+            EditSettings {
+                rotation: 90.0,
+                ..EditSettings::default()
+            },
+        );
+        let preview = workbench.base_preview().unwrap();
+        assert_eq!((preview.image.width(), preview.image.height()), (30, 40));
+        let job = workbench.begin_stitch().unwrap();
+        assert_eq!(job.rotations, vec![90.0, 0.0]);
+    }
+
+    #[test]
+    fn batch_edits_preserve_each_image_rotation() {
+        let repo = repo_with(2);
+        let mut workbench = Workbench::new();
+        add(&mut workbench, &repo, 2);
+        let first = workbench.project().images()[0].id;
+        let second = workbench.project().images()[1].id;
+        workbench.update_edits(
+            first,
+            EditSettings {
+                rotation: 90.0,
+                ..EditSettings::default()
+            },
+        );
+        workbench.update_edits(
+            second,
+            EditSettings {
+                rotation: 180.0,
+                ..EditSettings::default()
+            },
+        );
+        workbench.apply_edits_to_all(EditSettings {
+            invert: true,
+            rotation: 45.0,
+            ..EditSettings::default()
+        });
+        assert!(workbench.edits(first).invert);
+        assert!(workbench.edits(second).invert);
+        assert_eq!(workbench.edits(first).rotation, 90.0);
+        assert_eq!(workbench.edits(second).rotation, 180.0);
+    }
+
+    #[test]
+    fn changing_a_rotation_drops_the_stale_rough_placement() {
+        let repo = repo_with(2);
+        let mut workbench = Workbench::new();
+        add(&mut workbench, &repo, 2);
+        let second = workbench.project().images()[1].id;
+        workbench.set_manual_placement(second, Homography::translation(12.0, 4.0));
+        workbench.update_edits(
+            second,
+            EditSettings {
+                rotation: 90.0,
+                ..EditSettings::default()
+            },
+        );
+        assert_eq!(workbench.manual_placement(second), None);
+    }
+
+    #[test]
+    fn panorama_does_not_inherit_the_source_rotation() {
+        let repo = repo_with(1);
+        let mut workbench = Workbench::new();
+        add(&mut workbench, &repo, 1);
+        let id = workbench.selected().unwrap();
+        workbench.update_edits(
+            id,
+            EditSettings {
+                invert: true,
+                rotation: 90.0,
+                ..EditSettings::default()
+            },
+        );
+        workbench.finish_stitch(StitchResult {
+            image: Arc::new(RgbaImage::filled(10, 20, [1, 2, 3, 255])),
+            placements: Vec::new(),
+            diagnostics: stitch_domain::StitchDiagnostics::default(),
+        });
+        let panorama = workbench.current_edits();
+        assert!(panorama.invert);
+        assert_eq!(panorama.rotation, 0.0);
     }
 }

@@ -58,6 +58,15 @@ impl Homography {
         }
     }
 
+    /// Clockwise rotation in screen coordinates (`y` grows downwards).
+    pub fn rotation(degrees: f64) -> Self {
+        let radians = degrees.to_radians();
+        let (sin, cos) = radians.sin_cos();
+        Self {
+            m: [cos, -sin, 0.0, sin, cos, 0.0, 0.0, 0.0, 1.0],
+        }
+    }
+
     pub fn from_rows(rows: [[f64; 3]; 3]) -> Self {
         Self {
             m: [
@@ -205,6 +214,16 @@ mod tests {
             .unwrap();
         assert_eq!(quad[0], Point::new(5.0, 7.0));
         assert_eq!(quad[2], Point::new(104.0, 56.0));
+    }
+
+    #[test]
+    fn positive_rotation_is_clockwise_on_screen() {
+        let rotated = Homography::rotation(90.0);
+        assert_close(
+            rotated.transform(Point::new(1.0, 0.0)).unwrap(),
+            Point::new(0.0, 1.0),
+            1e-9,
+        );
     }
 
     #[test]

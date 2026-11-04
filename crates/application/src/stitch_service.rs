@@ -97,6 +97,46 @@ impl StitchService {
         options: &StitchOptions,
         progress: &dyn ProgressSink,
     ) -> CoreResult<StitchResult> {
+        self.stitch_with_rotations(images, &[], manual, options, progress)
+    }
+
+    /// Runs the pipeline after applying a clockwise rotation to each source.
+    ///
+    /// `rotations[i]` is in degrees and may be empty when no image rotates.
+    /// Manual placements are expressed in the rotated image's coordinates.
+    pub fn stitch_with_rotations(
+        &self,
+        images: &[SourceImage],
+        rotations: &[f32],
+        manual: &[Option<Homography>],
+        options: &StitchOptions,
+        progress: &dyn ProgressSink,
+    ) -> CoreResult<StitchResult> {
+        if !rotations.is_empty() && rotations.len() != images.len() {
+            return Err(CoreError::InvalidImage(
+                "every image needs exactly one rotation".to_owned(),
+            ));
+        }
+        let rotated;
+        let images = if rotations
+            .iter()
+            .any(|degrees| !stitch_domain::rotation_is_identity(*degrees))
+        {
+            rotated = rotate_images(images, rotations);
+            rotated.as_slice()
+        } else {
+            images
+        };
+        self.stitch_images(images, manual, options, progress)
+    }
+
+    fn stitch_images(
+        &self,
+        images: &[SourceImage],
+        manual: &[Option<Homography>],
+        options: &StitchOptions,
+        progress: &dyn ProgressSink,
+    ) -> CoreResult<StitchResult> {
         if images.is_empty() {
             return Err(CoreError::EmptyProject);
         }
@@ -431,6 +471,27 @@ struct AnalysisImage {
     features: FeatureSet,
 }
 
+fn rotate_images(images: &[SourceImage], rotations: &[f32]) -> Vec<SourceImage> {
+    images
+        .iter()
+        .enumerate()
+        .map(|(index, image)| {
+            let degrees = rotations.get(index).copied().unwrap_or(0.0);
+            if stitch_domain::rotation_is_identity(degrees) {
+                image.clone()
+            } else {
+                SourceImage {
+                    id: image.id,
+                    name: image.name.clone(),
+                    locator: image.locator.clone(),
+                    image: Arc::new(image.image.rotated(degrees)),
+                    thumbnail: image.thumbnail.clone(),
+                }
+            }
+        })
+        .collect()
+}
+
 /// Per-image transforms, color gains and pair diagnostics.
 type Registration = (Vec<Option<Homography>>, Vec<[f32; 3]>, Vec<PairDiagnostics>);
 
@@ -635,6 +696,39 @@ mod tests {
             .unwrap();
         assert_eq!(result.image.width(), 200);
         assert_eq!(result.placements[0].image_id, ImageId(7));
+    }
+
+    #[test]
+    fn rotations_are_applied_before_stitching() {
+        let service = service(0);
+        let images = vec![source(7)];
+        let result = service
+            .stitch_with_rotations(
+                &images,
+                &[90.0],
+                &[],
+                &StitchOptions::default(),
+                &stitch_domain::NoProgress,
+            )
+            .unwrap();
+        assert_eq!(result.image.width(), 100);
+        assert_eq!(result.image.height(), 200);
+    }
+
+    #[test]
+    fn every_image_needs_a_rotation_when_rotations_are_given() {
+        let service = service(0);
+        let images = vec![source(1), source(2)];
+        let error = service
+            .stitch_with_rotations(
+                &images,
+                &[90.0],
+                &[],
+                &StitchOptions::default(),
+                &stitch_domain::NoProgress,
+            )
+            .unwrap_err();
+        assert!(matches!(error, CoreError::InvalidImage(_)));
     }
 
     #[test]

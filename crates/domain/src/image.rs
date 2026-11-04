@@ -163,6 +163,65 @@ impl RgbaImage {
         })
     }
 
+    /// Returns the size after a clockwise rotation by `degrees`.
+    pub fn rotated_dimensions(width: u32, height: u32, degrees: f32) -> (u32, u32) {
+        let degrees = degrees.rem_euclid(360.0);
+        let quarter = degrees / 90.0;
+        if (quarter - quarter.round()).abs() <= 1e-4 {
+            return match quarter.round() as i64 % 4 {
+                1 | 3 => (height, width),
+                _ => (width, height),
+            };
+        }
+        let (_, _, new_width, new_height) = rotation_bounds(width, height, degrees);
+        (new_width, new_height)
+    }
+
+    /// Rotates clockwise by `degrees`. Quarter turns are lossless; other
+    /// angles are bilinearly resampled and padded with transparency.
+    pub fn rotated(&self, degrees: f32) -> Self {
+        let degrees = degrees.rem_euclid(360.0);
+        if degrees <= 1e-4 || 360.0 - degrees <= 1e-4 {
+            return self.clone();
+        }
+        let quarter = degrees / 90.0;
+        if (quarter - quarter.round()).abs() <= 1e-4 {
+            return match quarter.round() as i64 % 4 {
+                1 => self.rotated_quarter(1),
+                2 => self.rotated_quarter(2),
+                3 => self.rotated_quarter(3),
+                _ => self.clone(),
+            };
+        }
+
+        let (min_x, min_y, width, height) = rotation_bounds(self.width, self.height, degrees);
+        let radians = f64::from(degrees).to_radians();
+        let (sin, cos) = radians.sin_cos();
+        let center_x = (self.width.saturating_sub(1)) as f64 / 2.0;
+        let center_y = (self.height.saturating_sub(1)) as f64 / 2.0;
+
+        Self::from_fn(width, height, |x, y| {
+            let rx = x as f64 + min_x;
+            let ry = y as f64 + min_y;
+            let sx = center_x + cos * rx + sin * ry;
+            let sy = center_y - sin * rx + cos * ry;
+            self.sample_bilinear(sx, sy).unwrap_or([0, 0, 0, 0])
+        })
+    }
+
+    fn rotated_quarter(&self, quarter: i64) -> Self {
+        let (width, height) = match quarter % 4 {
+            1 | 3 => (self.height, self.width),
+            _ => (self.width, self.height),
+        };
+        Self::from_fn(width, height, |x, y| match quarter % 4 {
+            1 => self.pixel(y, self.height - 1 - x),
+            2 => self.pixel(self.width - 1 - x, self.height - 1 - y),
+            3 => self.pixel(self.width - 1 - y, x),
+            _ => self.pixel(x, y),
+        })
+    }
+
     /// Copies an axis-aligned rectangle, clamped to the image bounds.
     pub fn cropped(&self, x: u32, y: u32, width: u32, height: u32) -> Self {
         let x = x.min(self.width - 1);
@@ -203,6 +262,36 @@ impl RgbaImage {
     pub fn total_pixels(&self) -> usize {
         self.width as usize * self.height as usize
     }
+}
+
+/// Bounding box of a clockwise-rotated image in pixel-center coordinates.
+fn rotation_bounds(width: u32, height: u32, degrees: f32) -> (f64, f64, u32, u32) {
+    let radians = f64::from(degrees).to_radians();
+    let (sin, cos) = radians.sin_cos();
+    let center_x = (width.saturating_sub(1)) as f64 / 2.0;
+    let center_y = (height.saturating_sub(1)) as f64 / 2.0;
+    let last_x = width.saturating_sub(1) as f64;
+    let last_y = height.saturating_sub(1) as f64;
+    let mut min_x = f64::INFINITY;
+    let mut min_y = f64::INFINITY;
+    let mut max_x = f64::NEG_INFINITY;
+    let mut max_y = f64::NEG_INFINITY;
+    for (x, y) in [(0.0, 0.0), (last_x, 0.0), (last_x, last_y), (0.0, last_y)] {
+        let dx = x - center_x;
+        let dy = y - center_y;
+        let rx = cos * dx - sin * dy;
+        let ry = sin * dx + cos * dy;
+        min_x = min_x.min(rx);
+        min_y = min_y.min(ry);
+        max_x = max_x.max(rx);
+        max_y = max_y.max(ry);
+    }
+    (
+        min_x,
+        min_y,
+        (max_x - min_x).round().max(0.0) as u32 + 1,
+        (max_y - min_y).round().max(0.0) as u32 + 1,
+    )
 }
 
 /// Single-channel floating point image in the range `0..=1`.
@@ -348,5 +437,49 @@ mod tests {
     fn invalid_buffer_is_rejected() {
         assert!(RgbaImage::new(2, 2, vec![0; 15]).is_err());
         assert!(RgbaImage::new(0, 2, vec![]).is_err());
+    }
+
+    #[test]
+    fn quarter_turns_rotate_pixels_losslessly() {
+        let image = RgbaImage::from_fn(2, 1, |x, _| {
+            if x == 0 {
+                [255, 0, 0, 255]
+            } else {
+                [0, 0, 255, 255]
+            }
+        });
+        let clockwise = image.rotated(90.0);
+        assert_eq!((clockwise.width(), clockwise.height()), (1, 2));
+        assert_eq!(clockwise.pixel(0, 0), [255, 0, 0, 255]);
+        assert_eq!(clockwise.pixel(0, 1), [0, 0, 255, 255]);
+
+        let half = image.rotated(180.0);
+        assert_eq!((half.width(), half.height()), (2, 1));
+        assert_eq!(half.pixel(0, 0), [0, 0, 255, 255]);
+        assert_eq!(half.pixel(1, 0), [255, 0, 0, 255]);
+
+        let counter_clockwise = image.rotated(270.0);
+        assert_eq!(counter_clockwise.pixel(0, 0), [0, 0, 255, 255]);
+        assert_eq!(counter_clockwise.pixel(0, 1), [255, 0, 0, 255]);
+    }
+
+    #[test]
+    fn four_quarter_turns_are_identity() {
+        let image = RgbaImage::from_fn(5, 3, |x, y| [x as u8, y as u8, 7, 255]);
+        let round_trip = image
+            .rotated(90.0)
+            .rotated(90.0)
+            .rotated(90.0)
+            .rotated(90.0);
+        assert_eq!(round_trip, image);
+    }
+
+    #[test]
+    fn arbitrary_rotation_expands_the_bounds() {
+        let image = RgbaImage::filled(40, 20, [10, 20, 30, 255]);
+        let rotated = image.rotated(30.0);
+        assert!(rotated.width() > 40 && rotated.height() > 20);
+        let dimensions = RgbaImage::rotated_dimensions(40, 20, 30.0);
+        assert_eq!((rotated.width(), rotated.height()), dimensions);
     }
 }

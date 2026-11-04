@@ -18,8 +18,9 @@ use dialog::{
 use eframe::egui;
 use stitch_application::{ProjectService, StitchService};
 use stitch_domain::{
-    CoreResult, CurvePoint, EditSettings, Homography, ImageId, ImageLocator, RgbaImage,
-    SourceImage, StitchOptions, StitchProgress, StitchResult, ToneCurve,
+    normalized_rotation, rotation_is_identity, CoreResult, CurvePoint, EditSettings, Homography,
+    ImageId, ImageLocator, RgbaImage, SourceImage, StitchOptions, StitchProgress, StitchResult,
+    ToneCurve,
 };
 use stitch_renderer_wgpu::PreviewRenderer;
 use stitch_ui_core::{PreviewInfo, PreviewTarget, Workbench, WorkbenchStatus};
@@ -113,6 +114,7 @@ impl Default for PreviewState {
 struct PreviewCallback {
     image: Option<std::sync::Arc<RgbaImage>>,
     revision: u64,
+    ndc_rect: [f32; 4],
 }
 
 impl egui_wgpu::CallbackTrait for PreviewCallback {
@@ -130,7 +132,7 @@ impl egui_wgpu::CallbackTrait for PreviewCallback {
                 queue,
                 self.image.as_ref(),
                 self.revision,
-                [-1.0, 1.0, 1.0, -1.0],
+                self.ndc_rect,
             );
         }
         Vec::new()
@@ -179,35 +181,106 @@ const ARRANGE_OVERLAP: f32 = 0.15;
 struct ArrangeItem {
     id: ImageId,
     name: String,
-    /// Top-left corner in reference-image pixels.
+    /// Top-left corner of the transformed bounds in reference-image pixels.
     position: egui::Vec2,
-    /// Source image size in pixels.
-    size: egui::Vec2,
+    /// Source image size after the edit rotation, in pixels.
+    source_size: egui::Vec2,
+    /// Clockwise placement rotation in degrees.
+    rotation: f32,
+    /// Placement scale relative to the source pixels.
+    zoom: f32,
     texture: egui::TextureHandle,
+}
+
+impl ArrangeItem {
+    fn transformed_size(&self) -> egui::Vec2 {
+        transformed_size(self.source_size, self.rotation, self.zoom)
+    }
+
+    fn homography(&self) -> Homography {
+        let rotation = Homography::rotation(f64::from(self.rotation));
+        let scale = Homography::scale(f64::from(self.zoom), f64::from(self.zoom));
+        let linear = rotation.then(&scale);
+        let width = f64::from(self.source_size.x);
+        let height = f64::from(self.source_size.y);
+        let (min_x, min_y) = quad_bounds(&linear, width, height);
+        Homography::translation(
+            f64::from(self.position.x) - min_x,
+            f64::from(self.position.y) - min_y,
+        )
+        .then(&linear)
+    }
+}
+
+fn transformed_size(source: egui::Vec2, rotation: f32, zoom: f32) -> egui::Vec2 {
+    let (sin, cos) = rotation.to_radians().sin_cos();
+    let width = source.x * zoom;
+    let height = source.y * zoom;
+    egui::vec2(
+        width * cos.abs() + height * sin.abs(),
+        width * sin.abs() + height * cos.abs(),
+    )
+}
+
+fn quad_bounds(homography: &Homography, width: f64, height: f64) -> (f64, f64) {
+    let corners = [
+        stitch_domain::Point::new(0.0, 0.0),
+        stitch_domain::Point::new(width, 0.0),
+        stitch_domain::Point::new(width, height),
+        stitch_domain::Point::new(0.0, height),
+    ];
+    corners
+        .into_iter()
+        .filter_map(|corner| homography.transform(corner))
+        .fold((f64::INFINITY, f64::INFINITY), |(min_x, min_y), point| {
+            (min_x.min(point.x), min_y.min(point.y))
+        })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ArrangeLayout {
+    Horizontal,
+    Vertical,
 }
 
 struct ArrangeState {
     items: Vec<ArrangeItem>,
     scale: f32,
+    view_zoom: f32,
     scene: egui::Rect,
     drag: Option<usize>,
+    selected: Option<usize>,
+    layout: ArrangeLayout,
 }
 
 #[derive(Default)]
 struct ArrangeAction {
-    reset: bool,
+    reset: Option<ArrangeLayout>,
     confirm: bool,
 }
 
 impl ArrangeState {
     fn reset_layout(&mut self) {
         self.drag = None;
-        let first_height = self.items.first().map(|item| item.size.y).unwrap_or(0.0);
+        let extent = self
+            .items
+            .iter()
+            .map(|item| match self.layout {
+                ArrangeLayout::Horizontal => item.transformed_size().y,
+                ArrangeLayout::Vertical => item.transformed_size().x,
+            })
+            .fold(0.0_f32, f32::max);
         let mut cursor = 0.0;
         for item in &mut self.items {
-            let y = ((first_height - item.size.y) * 0.5).max(0.0);
-            item.position = egui::vec2(cursor, y);
-            cursor = item.position.x + item.size.x * (1.0 - ARRANGE_OVERLAP);
+            let size = item.transformed_size();
+            item.position = match self.layout {
+                ArrangeLayout::Horizontal => egui::vec2(cursor, ((extent - size.y) * 0.5).max(0.0)),
+                ArrangeLayout::Vertical => egui::vec2(((extent - size.x) * 0.5).max(0.0), cursor),
+            };
+            cursor += match self.layout {
+                ArrangeLayout::Horizontal => size.x,
+                ArrangeLayout::Vertical => size.y,
+            } * (1.0 - ARRANGE_OVERLAP);
         }
         self.rebuild_scene();
     }
@@ -215,8 +288,10 @@ impl ArrangeState {
     fn rebuild_scene(&mut self) {
         let mut bounds = egui::Rect::NOTHING;
         for item in &self.items {
-            let rect =
-                egui::Rect::from_min_size(egui::pos2(item.position.x, item.position.y), item.size);
+            let rect = egui::Rect::from_min_size(
+                egui::pos2(item.position.x, item.position.y),
+                item.transformed_size(),
+            );
             bounds = bounds.union(rect);
         }
         if !bounds.is_positive() {
@@ -355,8 +430,13 @@ impl ScanToImgApp {
                 let _ = progress_sender.send(WorkerEvent::Progress(progress));
                 progress_context.request_repaint();
             };
-            let result =
-                service.stitch_with_manual(&job.images, &job.manual, &job.options, &progress);
+            let result = service.stitch_with_rotations(
+                &job.images,
+                &job.rotations,
+                &job.manual,
+                &job.options,
+                &progress,
+            );
             let _ = sender.send(WorkerEvent::Done(Box::new(result)));
             finish_context.request_repaint();
         });
@@ -785,6 +865,38 @@ impl ScanToImgApp {
             .add(egui::Slider::new(&mut edits.contrast, -0.95..=0.95).text("Contrast"))
             .changed();
 
+        ui.horizontal(|ui| {
+            ui.label("Rotate");
+            if ui
+                .button("⟲ 90°")
+                .on_hover_text("Rotate a quarter turn counter-clockwise")
+                .clicked()
+            {
+                edits.rotation = normalized_rotation(edits.rotation - 90.0);
+                changed = true;
+            }
+            if ui
+                .button("⟳ 90°")
+                .on_hover_text("Rotate a quarter turn clockwise")
+                .clicked()
+            {
+                edits.rotation = normalized_rotation(edits.rotation + 90.0);
+                changed = true;
+            }
+            if ui.button("Reset").clicked() {
+                edits.rotation = 0.0;
+                changed = true;
+            }
+        });
+        changed |= ui
+            .add(
+                egui::DragValue::new(&mut edits.rotation)
+                    .range(0.0..=359.9)
+                    .speed(0.25)
+                    .suffix("°"),
+            )
+            .changed();
+
         if ui.button("Levels & curves…").clicked() {
             self.tone_open = true;
         }
@@ -852,36 +964,76 @@ impl ScanToImgApp {
                 .notify("Add at least two images before arranging them.");
             return;
         }
+        let rotations: Vec<f32> = images
+            .iter()
+            .map(|image| self.workbench.edits(image.id).rotation)
+            .collect();
+        let sizes: Vec<egui::Vec2> = images
+            .iter()
+            .zip(rotations.iter())
+            .map(|(image, rotation)| {
+                let (width, height) = RgbaImage::rotated_dimensions(
+                    image.image.width(),
+                    image.image.height(),
+                    *rotation,
+                );
+                egui::vec2(width as f32, height as f32)
+            })
+            .collect();
         let manual = self.workbench.manual_placements();
-        let first_height = images[0].image.height() as f32;
+        let first_height = sizes.first().map(|size| size.y).unwrap_or(0.0);
         let mut cursor = 0.0f32;
         let mut items = Vec::with_capacity(images.len());
         for (index, image) in images.iter().enumerate() {
-            let size = egui::vec2(image.image.width() as f32, image.image.height() as f32);
-            let position = match manual.get(index).copied().flatten() {
-                Some(placement) => egui::vec2(placement.m[2] as f32, placement.m[5] as f32),
-                None => egui::vec2(cursor, ((first_height - size.y) * 0.5).max(0.0)),
+            let source_size = sizes[index];
+            let (position, rotation, zoom) = manual
+                .get(index)
+                .copied()
+                .flatten()
+                .and_then(|placement| decompose_placement(placement, source_size))
+                .unwrap_or_else(|| {
+                    (
+                        egui::vec2(cursor, ((first_height - source_size.y) * 0.5).max(0.0)),
+                        0.0,
+                        1.0,
+                    )
+                });
+            cursor = position.x
+                + transformed_size(source_size, rotation, zoom).x * (1.0 - ARRANGE_OVERLAP);
+            let texture = if rotation_is_identity(rotations[index]) {
+                self.thumbnail(ctx, image)
+            } else {
+                let thumbnail = image.thumbnail.rotated(rotations[index]);
+                texture_from_rgba(
+                    ctx,
+                    format!("arrange-{}-{}", image.id.0, rotations[index].to_bits()),
+                    &thumbnail,
+                )
             };
-            cursor = position.x + size.x * (1.0 - ARRANGE_OVERLAP);
             items.push(ArrangeItem {
                 id: image.id,
                 name: image.name.clone(),
                 position,
-                size,
-                texture: self.thumbnail(ctx, image),
+                source_size,
+                rotation,
+                zoom,
+                texture,
             });
         }
-        let max_side = images
+        let max_side = sizes
             .iter()
-            .map(|image| image.image.width().max(image.image.height()))
-            .max()
-            .unwrap_or(1) as f32;
+            .map(|size| size.x.max(size.y))
+            .fold(0.0_f32, f32::max)
+            .max(1.0);
         let scale = (320.0 / max_side).clamp(0.01, 1.0);
         let mut state = ArrangeState {
             items,
             scale,
+            view_zoom: 1.0,
             scene: egui::Rect::NOTHING,
             drag: None,
+            selected: None,
+            layout: ArrangeLayout::Horizontal,
         };
         state.rebuild_scene();
         self.arrange = Some(state);
@@ -894,10 +1046,8 @@ impl ScanToImgApp {
         };
         self.workbench.clear_manual_placements();
         for item in state.items.iter().skip(1) {
-            self.workbench.set_manual_placement(
-                item.id,
-                Homography::translation(item.position.x as f64, item.position.y as f64),
-            );
+            self.workbench
+                .set_manual_placement(item.id, item.homography());
         }
         self.arrange_open = false;
         self.start_stitch(ctx);
@@ -911,26 +1061,51 @@ impl ScanToImgApp {
         let mut action = ArrangeAction::default();
         egui::Window::new("Rough arrange")
             .open(&mut open)
-            .default_size(egui::vec2(860.0, 580.0))
+            .default_size(egui::vec2(860.0, 620.0))
             .resizable(true)
             .show(ctx, |ui| {
                 ui.weak(
                     "Drag frames until the overlap looks right. Frame 1 is the reference and stays fixed. \
+                     Rotate or scale a frame to fit scans that were captured at an angle. \
                      The stitcher still refines every frame automatically and uses these placements only when no match is found.",
                 );
-                ui.horizontal(|ui| {
-                    if ui.button("Reset layout").clicked() {
-                        action.reset = true;
+                ui.horizontal_wrapped(|ui| {
+                    if ui.button("Row").clicked() {
+                        action.reset = Some(ArrangeLayout::Horizontal);
+                    }
+                    if ui.button("Column").clicked() {
+                        action.reset = Some(ArrangeLayout::Vertical);
                     }
                     if ui.button("Apply and stitch").clicked() {
                         action.confirm = true;
                     }
                 });
-                ui.separator();
                 if let Some(state) = self.arrange.as_mut() {
-                    if action.reset {
+                    if let Some(layout) = action.reset {
+                        state.layout = layout;
                         state.reset_layout();
                     }
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label("View zoom");
+                        if ui.button("−").clicked() {
+                            state.view_zoom = (state.view_zoom / 1.25).clamp(0.1, 4.0);
+                        }
+                        ui.add(
+                            egui::Slider::new(&mut state.view_zoom, 0.1..=4.0)
+                                .logarithmic(true)
+                                .show_value(false),
+                        );
+                        if ui.button("+").clicked() {
+                            state.view_zoom = (state.view_zoom * 1.25).clamp(0.1, 4.0);
+                        }
+                        if ui.button("Fit").clicked() {
+                            state.view_zoom = 1.0;
+                        }
+                    });
+                    if arrange_frame_controls(ui, state) {
+                        state.rebuild_scene();
+                    }
+                    ui.separator();
                     draw_arrange(ui, state);
                 }
             });
@@ -1130,6 +1305,19 @@ impl ScanToImgApp {
         let center = viewport.center() + self.preview.pan;
         let image_rect = egui::Rect::from_center_size(center, display);
 
+        let visible = image_rect.intersect(viewport);
+        if visible.is_positive() {
+            let ndc_rect = rect_in_ndc(image_rect, visible);
+            painter.add(egui_wgpu::Callback::new_paint_callback(
+                visible,
+                PreviewCallback {
+                    image: Some(preview.image.clone()),
+                    revision: preview.revision ^ u64::from(self.crop_mode) << 62,
+                    ndc_rect,
+                },
+            ));
+        }
+
         if self.crop_mode {
             if response.hovered() {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
@@ -1143,16 +1331,17 @@ impl ScanToImgApp {
             if response.dragged() && self.crop_start.is_some() {
                 self.crop_end = response.interact_pointer_pos().or(self.crop_end);
             }
+            let existing = self.workbench.current_edits().crop;
+            if self.crop_start.is_none() {
+                if let Some(crop) = existing {
+                    let rect = crop_on_screen(crop, &preview.image, image_rect);
+                    draw_crop_rect(&painter, rect, false);
+                }
+            }
             if let (Some(start), Some(end)) = (self.crop_start, self.crop_end) {
                 let rect = egui::Rect::from_two_pos(start, end).intersect(image_rect);
                 if rect.is_positive() {
-                    painter.rect_filled(rect, 0.0, egui::Color32::from_white_alpha(30));
-                    painter.rect_stroke(
-                        rect,
-                        0.0,
-                        egui::Stroke::new(2.0_f32, egui::Color32::from_rgb(255, 200, 60)),
-                        egui::StrokeKind::Inside,
-                    );
+                    draw_crop_rect(&painter, rect, true);
                 }
             }
             if response.drag_stopped() {
@@ -1215,17 +1404,6 @@ impl ScanToImgApp {
                     }
                 }
             }
-        }
-
-        let visible = image_rect.intersect(viewport);
-        if visible.is_positive() {
-            painter.add(egui_wgpu::Callback::new_paint_callback(
-                image_rect,
-                PreviewCallback {
-                    image: Some(preview.image.clone()),
-                    revision: preview.revision,
-                },
-            ));
         }
     }
 }
@@ -1304,9 +1482,122 @@ impl eframe::App for ScanToImgApp {
     }
 }
 
+fn decompose_placement(
+    placement: Homography,
+    source_size: egui::Vec2,
+) -> Option<(egui::Vec2, f32, f32)> {
+    let width = f64::from(source_size.x);
+    let height = f64::from(source_size.y);
+    if width <= 0.0 || height <= 0.0 {
+        return None;
+    }
+    let corner = |x, y| placement.transform(stitch_domain::Point::new(x, y));
+    let origin = corner(0.0, 0.0)?;
+    let right = corner(width, 0.0)?;
+    let bottom = corner(0.0, height)?;
+    let opposite = corner(width, height)?;
+    let dx = right.x - origin.x;
+    let dy = right.y - origin.y;
+    let length = (dx * dx + dy * dy).sqrt();
+    if !length.is_finite() || length <= 1e-9 {
+        return None;
+    }
+    let zoom = length / width;
+    let rotation = normalized_rotation(dy.atan2(dx).to_degrees() as f32);
+    let min_x = origin.x.min(right.x).min(bottom.x).min(opposite.x);
+    let min_y = origin.y.min(right.y).min(bottom.y).min(opposite.y);
+    if !zoom.is_finite() || !min_x.is_finite() || !min_y.is_finite() {
+        return None;
+    }
+    Some((
+        egui::vec2(min_x as f32, min_y as f32),
+        rotation,
+        zoom as f32,
+    ))
+}
+
+fn texture_from_rgba(ctx: &egui::Context, name: String, image: &RgbaImage) -> egui::TextureHandle {
+    let color = egui::ColorImage::from_rgba_unmultiplied(
+        [image.width() as usize, image.height() as usize],
+        image.pixels(),
+    );
+    ctx.load_texture(name, color, egui::TextureOptions::LINEAR)
+}
+
+fn arrange_quad(item: &ArrangeItem, origin: egui::Pos2, scale: f32) -> [egui::Pos2; 4] {
+    let placement = item.homography();
+    let width = f64::from(item.source_size.x);
+    let height = f64::from(item.source_size.y);
+    [(0.0, 0.0), (width, 0.0), (width, height), (0.0, height)].map(|(x, y)| {
+        let point = placement
+            .transform(stitch_domain::Point::new(x, y))
+            .unwrap_or_default();
+        origin + egui::vec2(point.x as f32, point.y as f32) * scale
+    })
+}
+
+fn arrange_frame_controls(ui: &mut egui::Ui, state: &mut ArrangeState) -> bool {
+    let Some(index) = state.selected else {
+        ui.weak("Click a frame to rotate or scale it.");
+        return false;
+    };
+    if index >= state.items.len() {
+        state.selected = None;
+        return false;
+    }
+    let reference = index == 0;
+    let item = &mut state.items[index];
+    let mut changed = false;
+    ui.horizontal_wrapped(|ui| {
+        ui.label(format!("Frame {} · {}", index + 1, item.name));
+        ui.add_enabled_ui(!reference, |ui| {
+            if ui
+                .button("⟲ 90°")
+                .on_hover_text("Rotate counter-clockwise")
+                .clicked()
+            {
+                item.rotation = normalized_rotation(item.rotation - 90.0);
+                changed = true;
+            }
+            if ui
+                .button("⟳ 90°")
+                .on_hover_text("Rotate clockwise")
+                .clicked()
+            {
+                item.rotation = normalized_rotation(item.rotation + 90.0);
+                changed = true;
+            }
+            changed |= ui
+                .add(
+                    egui::DragValue::new(&mut item.rotation)
+                        .speed(0.5)
+                        .suffix("°"),
+                )
+                .changed();
+            changed |= ui
+                .add(
+                    egui::Slider::new(&mut item.zoom, 0.1..=4.0)
+                        .logarithmic(true)
+                        .text("Scale"),
+                )
+                .changed();
+            if ui.button("Reset frame").clicked() {
+                item.rotation = 0.0;
+                item.zoom = 1.0;
+                changed = true;
+            }
+        });
+        if reference {
+            ui.weak("The reference frame stays fixed.");
+        }
+    });
+    item.rotation = normalized_rotation(item.rotation);
+    changed
+}
+
 fn draw_arrange(ui: &mut egui::Ui, state: &mut ArrangeState) {
     let viewport = ui.available_size();
-    let scale = state.scale;
+    let scale = state.scale * state.view_zoom;
     let scene = state.scene;
     let desired = egui::vec2(
         (scene.width() * scale).max(viewport.x.max(320.0)),
@@ -1323,21 +1614,25 @@ fn draw_arrange(ui: &mut egui::Ui, state: &mut ArrangeState) {
                 canvas.min + ((canvas.size() - scene_px) * 0.5) - scene.min.to_vec2() * scale;
 
             for index in 0..state.items.len() {
-                let (id, position, size) = {
+                let (id, quad) = {
                     let item = &state.items[index];
-                    (item.id, item.position, item.size)
+                    (item.id, arrange_quad(item, origin, scale))
                 };
-                let rect = egui::Rect::from_min_size(origin + position * scale, size * scale);
+                let bounds = egui::Rect::from_points(&quad);
                 let sense = if index == 0 {
-                    egui::Sense::hover()
+                    egui::Sense::click()
                 } else {
                     egui::Sense::click_and_drag()
                 };
                 let interaction =
-                    ui.interact(rect, ui.scope_id().with(("arrange-frame", id.0)), sense);
+                    ui.interact(bounds, ui.scope_id().with(("arrange-frame", id.0)), sense);
+                if interaction.clicked() {
+                    state.selected = Some(index);
+                }
                 if index > 0 {
                     if interaction.drag_started() {
                         state.drag = Some(index);
+                        state.selected = Some(index);
                     }
                     if interaction.dragged() && state.drag == Some(index) {
                         state.items[index].position += interaction.drag_delta() / scale;
@@ -1355,27 +1650,39 @@ fn draw_arrange(ui: &mut egui::Ui, state: &mut ArrangeState) {
                 }
 
                 let item = &state.items[index];
-                painter.image(
-                    item.texture.id(),
-                    rect,
-                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                    egui::Color32::WHITE,
-                );
-                let stroke = if state.drag == Some(index) {
+                let quad = arrange_quad(item, origin, scale);
+                let mut mesh = egui::Mesh::with_texture(item.texture.id());
+                let uvs = [
+                    egui::pos2(0.0, 0.0),
+                    egui::pos2(1.0, 0.0),
+                    egui::pos2(1.0, 1.0),
+                    egui::pos2(0.0, 1.0),
+                ];
+                for (position, uv) in quad.into_iter().zip(uvs) {
+                    mesh.vertices.push(egui::epaint::Vertex {
+                        pos: position,
+                        uv,
+                        color: egui::Color32::WHITE,
+                    });
+                }
+                mesh.indices.extend_from_slice(&[0, 1, 2, 0, 2, 3]);
+                painter.add(egui::Shape::mesh(mesh));
+
+                let stroke = if state.drag == Some(index) || state.selected == Some(index) {
                     egui::Stroke::new(2.0_f32, egui::Color32::from_rgb(255, 200, 60))
                 } else if index == 0 {
                     egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(90, 170, 240))
                 } else {
                     egui::Stroke::new(1.0_f32, egui::Color32::from_gray(120))
                 };
-                painter.rect_stroke(rect, 2.0, stroke, egui::StrokeKind::Inside);
+                painter.add(egui::Shape::closed_line(quad.to_vec(), stroke));
                 let caption = if index == 0 {
                     format!("1 · {} · reference", item.name)
                 } else {
                     format!("{} · {}", index + 1, item.name)
                 };
                 painter.text(
-                    rect.left_top() + egui::vec2(5.0, 4.0),
+                    egui::Rect::from_points(&quad).left_top() + egui::vec2(5.0, 4.0),
                     egui::Align2::LEFT_TOP,
                     caption,
                     egui::FontId::proportional(12.0),
@@ -1571,6 +1878,54 @@ fn crop_from_screen(
         width,
         height,
     })
+}
+
+/// Projects the visible part of the image into the callback viewport.
+fn rect_in_ndc(image_rect: egui::Rect, viewport: egui::Rect) -> [f32; 4] {
+    let width = viewport.width().max(1.0);
+    let height = viewport.height().max(1.0);
+    [
+        (image_rect.left() - viewport.left()) / width * 2.0 - 1.0,
+        1.0 - (image_rect.top() - viewport.top()) / height * 2.0,
+        (image_rect.right() - viewport.left()) / width * 2.0 - 1.0,
+        1.0 - (image_rect.bottom() - viewport.top()) / height * 2.0,
+    ]
+}
+
+fn crop_on_screen(
+    crop: stitch_domain::CropRect,
+    image: &RgbaImage,
+    image_rect: egui::Rect,
+) -> egui::Rect {
+    let width = image.width().max(1) as f32;
+    let height = image.height().max(1) as f32;
+    let min = egui::pos2(
+        image_rect.left() + crop.x as f32 / width * image_rect.width(),
+        image_rect.top() + crop.y as f32 / height * image_rect.height(),
+    );
+    let max = egui::pos2(
+        image_rect.left() + (crop.x + crop.width) as f32 / width * image_rect.width(),
+        image_rect.top() + (crop.y + crop.height) as f32 / height * image_rect.height(),
+    );
+    egui::Rect::from_min_max(min, max)
+}
+
+fn draw_crop_rect(painter: &egui::Painter, rect: egui::Rect, active: bool) {
+    if !rect.is_positive() {
+        return;
+    }
+    painter.rect_filled(rect, 0.0, egui::Color32::from_white_alpha(30));
+    let color = if active {
+        egui::Color32::from_rgb(255, 200, 60)
+    } else {
+        egui::Color32::from_rgb(230, 160, 40)
+    };
+    painter.rect_stroke(
+        rect,
+        0.0,
+        egui::Stroke::new(2.0_f32, color),
+        egui::StrokeKind::Inside,
+    );
 }
 
 fn draw_swatch(ui: &mut egui::Ui, color: [u8; 3]) {

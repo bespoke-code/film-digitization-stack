@@ -270,6 +270,25 @@ impl CropRect {
     }
 }
 
+/// Normalizes a clockwise angle into `0..360`.
+pub fn normalized_rotation(degrees: f32) -> f32 {
+    if !degrees.is_finite() {
+        return 0.0;
+    }
+    let normalized = degrees.rem_euclid(360.0);
+    if 360.0 - normalized <= 1e-4 {
+        0.0
+    } else {
+        normalized
+    }
+}
+
+/// True when an angle is a no-op for the viewer.
+pub fn rotation_is_identity(degrees: f32) -> bool {
+    let normalized = normalized_rotation(degrees);
+    normalized <= 1e-4
+}
+
 /// All adjustments for one photo.
 #[derive(Clone, Debug, PartialEq)]
 pub struct EditSettings {
@@ -281,6 +300,8 @@ pub struct EditSettings {
     pub levels: Levels,
     pub curves: Curves,
     pub crop: Option<CropRect>,
+    /// Clockwise rotation in degrees, applied before the crop.
+    pub rotation: f32,
 }
 
 impl Default for EditSettings {
@@ -294,6 +315,7 @@ impl Default for EditSettings {
             levels: Levels::default(),
             curves: Curves::default(),
             crop: None,
+            rotation: 0.0,
         }
     }
 }
@@ -304,6 +326,7 @@ impl EditSettings {
         self.contrast = self.contrast.clamp(-0.95, 0.95);
         self.levels = self.levels.sanitized();
         self.curves = self.curves.sanitized();
+        self.rotation = normalized_rotation(self.rotation);
         self
     }
 
@@ -316,6 +339,7 @@ impl EditSettings {
             && self.levels.is_identity()
             && self.curves.is_identity()
             && self.crop.is_none()
+            && rotation_is_identity(self.rotation)
     }
 
     /// Applies all adjustments at full resolution.
@@ -323,18 +347,18 @@ impl EditSettings {
         if self.is_identity() {
             return image.clone();
         }
-        let cropped = self.cropped(image);
-        self.develop_exact(cropped.as_ref())
+        let prepared = self.prepared(image);
+        self.develop_exact(prepared.as_ref())
     }
 
     /// Applies all adjustments and limits the longest side for display.
     pub fn develop_preview(&self, image: &RgbaImage, max_dimension: u32) -> RgbaImage {
-        let cropped = self.cropped(image);
-        let max_side = cropped.as_ref().width().max(cropped.as_ref().height());
+        let prepared = self.prepared(image);
+        let max_side = prepared.as_ref().width().max(prepared.as_ref().height());
         let fitted = if max_dimension > 0 && max_side > max_dimension {
-            Cow::Owned(cropped.as_ref().resized_to_fit(max_dimension))
+            Cow::Owned(prepared.as_ref().resized_to_fit(max_dimension))
         } else {
-            cropped
+            prepared
         };
         if self.is_identity() {
             return fitted.into_owned();
@@ -342,13 +366,24 @@ impl EditSettings {
         self.develop_exact(fitted.as_ref())
     }
 
-    fn cropped<'a>(&self, image: &'a RgbaImage) -> Cow<'a, RgbaImage> {
+    /// The source image after rotation and cropping, before tone adjustments.
+    pub fn prepared<'a>(&self, image: &'a RgbaImage) -> Cow<'a, RgbaImage> {
+        let rotated = if rotation_is_identity(self.rotation) {
+            Cow::Borrowed(image)
+        } else {
+            Cow::Owned(image.rotated(normalized_rotation(self.rotation)))
+        };
         match self
             .crop
-            .and_then(|crop| crop.clamped(image.width(), image.height()))
+            .and_then(|crop| crop.clamped(rotated.width(), rotated.height()))
         {
-            Some(crop) => Cow::Owned(image.cropped(crop.x, crop.y, crop.width, crop.height)),
-            None => Cow::Borrowed(image),
+            Some(crop) => Cow::Owned(rotated.as_ref().cropped(
+                crop.x,
+                crop.y,
+                crop.width,
+                crop.height,
+            )),
+            None => rotated,
         }
     }
 
@@ -560,6 +595,30 @@ mod tests {
     }
 
     #[test]
+    fn rotation_happens_before_the_crop() {
+        let image = RgbaImage::from_fn(2, 1, |x, _| {
+            if x == 0 {
+                [255, 0, 0, 255]
+            } else {
+                [0, 0, 255, 255]
+            }
+        });
+        let settings = EditSettings {
+            rotation: 90.0,
+            crop: Some(CropRect {
+                x: 0,
+                y: 1,
+                width: 1,
+                height: 1,
+            }),
+            ..EditSettings::default()
+        };
+        let developed = settings.develop(&image);
+        assert_eq!((developed.width(), developed.height()), (1, 1));
+        assert_eq!(developed.pixel(0, 0), [0, 0, 255, 255]);
+    }
+
+    #[test]
     fn suggested_film_base_follows_the_bright_border() {
         let image = RgbaImage::from_fn(100, 80, |x, y| {
             if x < 8 || y < 8 || x >= 92 || y >= 72 {
@@ -571,6 +630,17 @@ mod tests {
         let base = suggest_film_base(&image);
         assert!(base[0] > base[1] && base[1] > base[2]);
         assert!(base[0] >= 180);
+    }
+
+    #[test]
+    fn rotation_is_normalized_and_finite() {
+        assert_eq!(normalized_rotation(0.0), 0.0);
+        assert_eq!(normalized_rotation(360.0), 0.0);
+        assert_eq!(normalized_rotation(-90.0), 270.0);
+        assert_eq!(normalized_rotation(450.0), 90.0);
+        assert_eq!(normalized_rotation(f32::NAN), 0.0);
+        assert!(rotation_is_identity(720.0));
+        assert!(!rotation_is_identity(0.1));
     }
 
     #[test]

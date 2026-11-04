@@ -41,10 +41,12 @@ Pass image paths to open them at launch:
 ## Use
 
 1. Open a folder, add up to 16 images, or drag files onto the window.
-2. Put overlapping frames in order and press **Stitch panorama**. If a pair has
-   no usable detail, press **Rough arrange…**, drag the frames and apply.
-3. Inspect the result in the zoomable preview.
-4. Export as PNG, JPEG, TIFF, WebP or BMP.
+2. Put overlapping frames in order and press **Stitch panorama**. Use the rotate
+   controls in the Develop pane when a scan is sideways.
+3. If a pair has no usable detail, press **Rough arrange…**, then drag, rotate or
+   scale the frames and apply. Row and Column give a fresh starting layout.
+4. Inspect the result in the zoomable preview and rotate the panorama if needed.
+5. Export as PNG, JPEG, TIFF, WebP or BMP.
 
 Source files are never modified.
 
