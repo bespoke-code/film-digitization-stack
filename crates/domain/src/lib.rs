@@ -17,6 +17,7 @@ pub mod error;
 pub mod features;
 pub mod geometry;
 pub mod image;
+pub mod metadata;
 pub mod ports;
 pub mod project;
 pub mod stitch;
@@ -29,6 +30,7 @@ pub use error::{CoreError, CoreResult};
 pub use features::{Descriptor, Feature, FeatureMatch, FeatureSet, Keypoint};
 pub use geometry::{Homography, Point};
 pub use image::{GrayImage, RgbaImage};
+pub use metadata::PhotoMetadata;
 pub use ports::{
     Clock, Compositor, FeatureExtractor, FeatureMatcher, HomographyEstimator, ImageRepository,
     LoadedImage, NoProgress, ProgressSink, Renderer, SharedCompositor, SharedEstimator,

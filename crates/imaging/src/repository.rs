@@ -1,9 +1,14 @@
 //! Decode/encode images from the filesystem using the pure-Rust `image` crate.
 
+use std::io::Cursor;
 use std::path::Path;
 
 use image::{DynamicImage, ImageFormat, RgbaImage as ImageRgbaImage};
-use stitch_domain::{CoreError, CoreResult, ImageLocator, ImageRepository, LoadedImage, RgbaImage};
+use stitch_domain::{
+    CoreError, CoreResult, ImageLocator, ImageRepository, LoadedImage, PhotoMetadata, RgbaImage,
+};
+
+use crate::metadata::embed_metadata;
 
 /// Filesystem-backed [`ImageRepository`].
 #[derive(Clone, Debug)]
@@ -84,8 +89,32 @@ impl ImageRepository for FileImageRepository {
     }
 
     fn save(&self, locator: &ImageLocator, image: &RgbaImage) -> CoreResult<()> {
-        let path = Self::path(locator);
-        let format = ImageFormat::from_path(path)
+        let (bytes, _) = self.encode(locator, image)?;
+        self.write(locator, &bytes)
+    }
+
+    fn save_with_metadata(
+        &self,
+        locator: &ImageLocator,
+        image: &RgbaImage,
+        metadata: Option<&PhotoMetadata>,
+    ) -> CoreResult<()> {
+        let Some(metadata) = metadata.filter(|metadata| !metadata.is_empty()) else {
+            return self.save(locator, image);
+        };
+        let (bytes, format) = self.encode(locator, image)?;
+        let bytes = embed_metadata(&bytes, format, metadata).unwrap_or(bytes);
+        self.write(locator, &bytes)
+    }
+}
+
+impl FileImageRepository {
+    fn encode(
+        &self,
+        locator: &ImageLocator,
+        image: &RgbaImage,
+    ) -> CoreResult<(Vec<u8>, ImageFormat)> {
+        let format = ImageFormat::from_path(Self::path(locator))
             .map_err(|_| CoreError::UnsupportedFormat(locator.as_str().to_owned()))?;
         if !matches!(
             format,
@@ -97,16 +126,6 @@ impl ImageRepository for FileImageRepository {
         ) {
             return Err(CoreError::UnsupportedFormat(locator.as_str().to_owned()));
         }
-
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() && !parent.exists() {
-                std::fs::create_dir_all(parent).map_err(|error| CoreError::Io {
-                    path: parent.to_string_lossy().into_owned(),
-                    message: error.to_string(),
-                })?;
-            }
-        }
-
         let rgba = ImageRgbaImage::from_raw(image.width(), image.height(), image.pixels().to_vec())
             .ok_or_else(|| {
                 CoreError::InvalidImage(
@@ -117,12 +136,30 @@ impl ImageRepository for FileImageRepository {
         if matches!(format, ImageFormat::Jpeg) {
             dynamic = DynamicImage::ImageRgb8(dynamic.to_rgb8());
         }
+        let mut bytes = Vec::new();
         dynamic
-            .save_with_format(path, format)
+            .write_to(&mut Cursor::new(&mut bytes), format)
             .map_err(|error| CoreError::Encode {
                 name: locator.display_name(),
                 message: error.to_string(),
-            })
+            })?;
+        Ok((bytes, format))
+    }
+
+    fn write(&self, locator: &ImageLocator, bytes: &[u8]) -> CoreResult<()> {
+        let path = Self::path(locator);
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() && !parent.exists() {
+                std::fs::create_dir_all(parent).map_err(|error| CoreError::Io {
+                    path: parent.to_string_lossy().into_owned(),
+                    message: error.to_string(),
+                })?;
+            }
+        }
+        std::fs::write(path, bytes).map_err(|error| CoreError::Io {
+            path: path.to_string_lossy().into_owned(),
+            message: error.to_string(),
+        })
     }
 }
 
@@ -158,6 +195,28 @@ mod tests {
         let locator = ImageLocator::new(dir.path().join("missing.png").to_string_lossy());
         let error = FileImageRepository::default().load(&locator).unwrap_err();
         assert!(matches!(error, CoreError::NotFound(_)));
+    }
+
+    #[test]
+    fn save_with_metadata_embeds_exif() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("image.png");
+        let locator = ImageLocator::new(path.to_string_lossy());
+        let image = RgbaImage::filled(24, 16, [1, 2, 3, 255]);
+        let metadata = PhotoMetadata {
+            camera: "Nikon FM2".to_owned(),
+            film: "Kodak Portra 400".to_owned(),
+            ..PhotoMetadata::default()
+        };
+        let repository = FileImageRepository::default();
+        repository
+            .save_with_metadata(&locator, &image, Some(&metadata))
+            .unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        assert!(bytes.windows(4).any(|window| window == b"eXIf"));
+        assert!(String::from_utf8_lossy(&bytes).contains("Nikon FM2"));
+        let loaded = repository.load(&locator).unwrap();
+        assert_eq!(loaded.image.width(), 24);
     }
 
     #[test]

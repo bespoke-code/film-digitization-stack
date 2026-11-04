@@ -3,8 +3,8 @@
 use std::sync::Arc;
 
 use stitch_domain::{
-    CoreError, CoreResult, ImageId, ImageLocator, ImageRepository, LoadedImage, Project, RgbaImage,
-    MAX_IMAGES,
+    CoreError, CoreResult, ImageId, ImageLocator, ImageRepository, LoadedImage, PhotoMetadata,
+    Project, RgbaImage, MAX_IMAGES,
 };
 
 /// Application service around image persistence.
@@ -52,5 +52,15 @@ impl ProjectService {
 
     pub fn export(&self, locator: &ImageLocator, image: &RgbaImage) -> CoreResult<()> {
         self.repository.save(locator, image)
+    }
+
+    /// Exports an image and embeds the given descriptive metadata when possible.
+    pub fn export_with_metadata(
+        &self,
+        locator: &ImageLocator,
+        image: &RgbaImage,
+        metadata: Option<&PhotoMetadata>,
+    ) -> CoreResult<()> {
+        self.repository.save_with_metadata(locator, image, metadata)
     }
 }

@@ -12,8 +12,8 @@ use std::sync::Arc;
 use stitch_application::{ProjectService, StitchService};
 use stitch_domain::{
     suggest_film_base, CoreError, CoreResult, EditSettings, Homography, ImageId, ImageLocator,
-    Project, RgbaImage, SourceImage, StitchOptions, StitchProgress, StitchResult, StitchStage,
-    MAX_IMAGES,
+    PhotoMetadata, Project, RgbaImage, SourceImage, StitchOptions, StitchProgress, StitchResult,
+    StitchStage, MAX_IMAGES,
 };
 
 /// Longest side used for an edited preview.
@@ -93,6 +93,8 @@ pub struct Workbench {
     status: WorkbenchStatus,
     edits: HashMap<ImageId, EditSettings>,
     result_edits: EditSettings,
+    metadata: HashMap<ImageId, PhotoMetadata>,
+    result_metadata: PhotoMetadata,
     manual: HashMap<ImageId, Homography>,
     show_edits: bool,
     preview_cache: RefCell<Option<PreviewCache>>,
@@ -116,6 +118,8 @@ impl Workbench {
             status: WorkbenchStatus::Empty,
             edits: HashMap::new(),
             result_edits: EditSettings::default(),
+            metadata: HashMap::new(),
+            result_metadata: PhotoMetadata::default(),
             manual: HashMap::new(),
             show_edits: true,
             preview_cache: RefCell::new(None),
@@ -181,6 +185,75 @@ impl Workbench {
 
     pub fn edits(&self, id: ImageId) -> EditSettings {
         self.edits.get(&id).cloned().unwrap_or_default()
+    }
+
+    /// Descriptive metadata for one source image.
+    pub fn image_metadata(&self, id: ImageId) -> PhotoMetadata {
+        self.metadata.get(&id).cloned().unwrap_or_default()
+    }
+
+    /// Metadata for the current preview: the panorama or the selected image.
+    pub fn has_preview(&self) -> bool {
+        match self.preview_target {
+            PreviewTarget::Stitched => self.result.is_some(),
+            PreviewTarget::Image(_) => !self.project.is_empty(),
+        }
+    }
+
+    pub fn current_metadata(&self) -> PhotoMetadata {
+        match self.preview_target {
+            PreviewTarget::Stitched => self.result_metadata.clone(),
+            PreviewTarget::Image(id) => self.image_metadata(id),
+        }
+    }
+
+    pub fn update_image_metadata(&mut self, id: ImageId, metadata: PhotoMetadata) {
+        if self.project.get(id).is_none() {
+            return;
+        }
+        let metadata = metadata.bounded();
+        if self.metadata.get(&id) != Some(&metadata) {
+            self.metadata.insert(id, metadata);
+        }
+    }
+
+    pub fn update_current_metadata(&mut self, metadata: PhotoMetadata) {
+        match self.preview_target {
+            PreviewTarget::Stitched => {
+                let metadata = metadata.bounded();
+                if self.result_metadata != metadata {
+                    self.result_metadata = metadata;
+                }
+            }
+            PreviewTarget::Image(id) => self.update_image_metadata(id, metadata),
+        }
+    }
+
+    pub fn reset_current_metadata(&mut self) {
+        self.update_current_metadata(PhotoMetadata::default());
+    }
+
+    /// Copies metadata to every image and the panorama for batch work.
+    pub fn apply_metadata_to_all(&mut self, metadata: PhotoMetadata) {
+        let metadata = metadata.bounded();
+        let mut changed = false;
+        for image in self.project.images() {
+            if self.metadata.get(&image.id) != Some(&metadata) {
+                self.metadata.insert(image.id, metadata.clone());
+                changed = true;
+            }
+        }
+        if self.result.is_some() && self.result_metadata != metadata {
+            self.result_metadata = metadata;
+            changed = true;
+        }
+        if changed {
+            self.set_status(WorkbenchStatus::Ready(format!(
+                "Applied metadata to {} image{}.",
+                self.project.len(),
+                if self.project.len() == 1 { "" } else { "s" }
+            )));
+        }
     }
 
     /// Rough placement of one image in the reference frame, when the user set it.
@@ -375,6 +448,7 @@ impl Workbench {
         let ids = service.add_images(&mut self.project, locators)?;
         for &id in &ids {
             self.edits.insert(id, EditSettings::default());
+            self.metadata.insert(id, PhotoMetadata::default());
         }
         if let Some(&id) = ids.first() {
             self.selected = Some(id);
@@ -397,6 +471,7 @@ impl Workbench {
     pub fn remove_image(&mut self, id: ImageId) -> CoreResult<()> {
         self.project.remove(id)?;
         self.edits.remove(&id);
+        self.metadata.remove(&id);
         self.manual.clear();
         if self.selected == Some(id) {
             self.selected = self.project.images().first().map(|image| image.id);
@@ -438,8 +513,10 @@ impl Workbench {
         self.selected = None;
         self.result = None;
         self.edits.clear();
+        self.metadata.clear();
         self.manual.clear();
         self.result_edits = EditSettings::default();
+        self.result_metadata = PhotoMetadata::default();
         self.preview_target = PreviewTarget::Stitched;
         self.bump_revision();
         self.set_status(WorkbenchStatus::Empty);
@@ -579,6 +656,11 @@ impl Workbench {
         } else if size_changed {
             self.result_edits.crop = None;
         }
+        if self.result.is_none() && self.result_metadata.is_empty() {
+            if let Some(image) = self.project.images().first() {
+                self.result_metadata = self.image_metadata(image.id);
+            }
+        }
         self.result = Some(result);
         self.preview_target = PreviewTarget::Stitched;
         self.bump_revision();
@@ -607,7 +689,7 @@ impl Workbench {
     pub fn export(&self, service: &ProjectService, locator: &ImageLocator) -> CoreResult<()> {
         let (base, _) = self.base_image().ok_or(CoreError::NoStitchResult)?;
         let image = self.current_edits().develop(&base);
-        service.export(locator, &image)
+        service.export_with_metadata(locator, &image, Some(&self.current_metadata()))
     }
 
     /// Writes every loaded image and, when present, the panorama to a folder.
@@ -625,7 +707,11 @@ impl Workbench {
             let stem = export_stem(&image.locator, image.id.0);
             let path = folder.join(format!("{stem}-edited.{extension}"));
             let developed = self.edits(image.id).develop(&image.image);
-            service.export(&ImageLocator::from(path.as_path()), &developed)?;
+            service.export_with_metadata(
+                &ImageLocator::from(path.as_path()),
+                &developed,
+                Some(&self.image_metadata(image.id)),
+            )?;
             written += 1;
         }
         if let Some(result) = &self.result {
@@ -637,7 +723,11 @@ impl Workbench {
                 .unwrap_or_else(|| "panorama".to_owned());
             let path = folder.join(format!("{stem}-stitched.{extension}"));
             let developed = self.result_edits.develop(&result.image);
-            service.export(&ImageLocator::from(path.as_path()), &developed)?;
+            service.export_with_metadata(
+                &ImageLocator::from(path.as_path()),
+                &developed,
+                Some(&self.result_metadata),
+            )?;
             written += 1;
         }
         Ok(written)
@@ -703,6 +793,7 @@ mod tests {
     struct MemoryRepo {
         images: Mutex<HashMap<String, LoadedImage>>,
         saved: Mutex<Vec<(String, RgbaImage)>>,
+        saved_metadata: Mutex<Vec<(String, Option<PhotoMetadata>)>>,
     }
 
     impl ImageRepository for MemoryRepo {
@@ -721,6 +812,19 @@ mod tests {
                 .unwrap()
                 .push((locator.as_str().to_owned(), image.clone()));
             Ok(())
+        }
+
+        fn save_with_metadata(
+            &self,
+            locator: &ImageLocator,
+            image: &RgbaImage,
+            metadata: Option<&PhotoMetadata>,
+        ) -> CoreResult<()> {
+            self.saved_metadata
+                .lock()
+                .unwrap()
+                .push((locator.as_str().to_owned(), metadata.cloned()));
+            self.save(locator, image)
         }
     }
 
@@ -1073,6 +1177,49 @@ mod tests {
             },
         );
         assert_eq!(workbench.manual_placement(second), None);
+    }
+
+    #[test]
+    fn panorama_inherits_and_exports_the_source_metadata() {
+        let repo = repo_with(1);
+        let mut workbench = Workbench::new();
+        add(&mut workbench, &repo, 1);
+        let id = workbench.selected().unwrap();
+        let metadata = PhotoMetadata {
+            camera: "Nikon FM2".to_owned(),
+            film: "Kodak Portra 400".to_owned(),
+            ..PhotoMetadata::default()
+        };
+        workbench.update_image_metadata(id, metadata.clone());
+        workbench.finish_stitch(StitchResult {
+            image: Arc::new(RgbaImage::filled(8, 8, [10, 20, 30, 255])),
+            placements: Vec::new(),
+            diagnostics: stitch_domain::StitchDiagnostics::default(),
+        });
+        workbench.show_stitched().unwrap();
+        assert_eq!(workbench.current_metadata(), metadata);
+
+        let service = ProjectService::new(repo.clone());
+        workbench
+            .export(&service, &ImageLocator::new("panorama.png"))
+            .unwrap();
+        let saved = repo.saved_metadata.lock().unwrap();
+        assert_eq!(saved.last().unwrap().1, Some(metadata));
+    }
+
+    #[test]
+    fn metadata_can_be_applied_to_every_image() {
+        let repo = repo_with(3);
+        let mut workbench = Workbench::new();
+        add(&mut workbench, &repo, 3);
+        let metadata = PhotoMetadata {
+            camera: "Nikon FM2".to_owned(),
+            ..PhotoMetadata::default()
+        };
+        workbench.apply_metadata_to_all(metadata.clone());
+        for image in workbench.project().images() {
+            assert_eq!(workbench.image_metadata(image.id), metadata);
+        }
     }
 
     #[test]

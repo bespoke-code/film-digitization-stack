@@ -957,6 +957,63 @@ impl ScanToImgApp {
         }
     }
 
+    fn metadata(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Metadata");
+        if !self.workbench.has_preview() {
+            ui.weak("Select an image or stitch a panorama to add metadata.");
+            return;
+        }
+
+        let mut metadata = self.workbench.current_metadata();
+        let mut changed = false;
+        egui::Grid::new("photo-metadata")
+            .num_columns(2)
+            .spacing([8.0, 4.0])
+            .show(ui, |ui| {
+                changed |= metadata_field(ui, "Camera", "Nikon FM2", &mut metadata.camera);
+                changed |= metadata_field(ui, "Lens", "Nikkor 50mm f/1.8", &mut metadata.lens);
+                changed |= metadata_field(ui, "Film", "Kodak Portra 400", &mut metadata.film);
+                changed |= metadata_field(ui, "ISO", "400", &mut metadata.iso);
+                changed |= metadata_field(ui, "Aperture", "f/2.8", &mut metadata.aperture);
+                changed |= metadata_field(ui, "Shutter", "1/125", &mut metadata.shutter_speed);
+                changed |= metadata_field(ui, "Focal length", "50 mm", &mut metadata.focal_length);
+                changed |= metadata_field(ui, "Date", "YYYY-MM-DD", &mut metadata.date);
+                changed |= metadata_field(ui, "Location", "", &mut metadata.location);
+                ui.label("Notes");
+                changed |= ui
+                    .add(
+                        egui::TextEdit::multiline(&mut metadata.notes)
+                            .desired_rows(3)
+                            .desired_width(160.0)
+                            .hint_text("Development, scanner, push process…"),
+                    )
+                    .changed();
+                ui.end_row();
+            });
+
+        let mut reset = false;
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(
+                    self.workbench.project().len() > 1 || self.workbench.result().is_some(),
+                    egui::Button::new("Apply to all"),
+                )
+                .on_hover_text("Copy these details to every photo and the panorama")
+                .clicked()
+            {
+                self.workbench.apply_metadata_to_all(metadata.clone());
+            }
+            reset = ui.button("Reset").clicked();
+        });
+        ui.weak("Metadata is written into exported PNG, JPEG and WebP files.");
+
+        if reset {
+            self.workbench.reset_current_metadata();
+        } else if changed {
+            self.workbench.update_current_metadata(metadata);
+        }
+    }
+
     fn open_arrange(&mut self, ctx: &egui::Context) {
         let images = self.workbench.project().images().to_vec();
         if images.len() < 2 {
@@ -1452,20 +1509,26 @@ impl eframe::App for ScanToImgApp {
             .default_size(320.0)
             .size_range(260.0..=460.0)
             .show(ui, |ui| {
-                self.develop(ui);
-                ui.separator();
-                if let Some(preview) = self.workbench.preview() {
-                    self.histogram.update(&preview);
-                    ui.heading("Histogram");
-                    draw_histogram(ui, &self.histogram.histogram);
-                }
-                ui.separator();
-                egui::CollapsingHeader::new("Stitch settings")
-                    .default_open(false)
-                    .show(ui, |ui| self.settings(ui));
-                egui::CollapsingHeader::new("Diagnostics")
-                    .default_open(true)
-                    .show(ui, |ui| self.diagnostics(ui));
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        self.develop(ui);
+                        ui.separator();
+                        self.metadata(ui);
+                        ui.separator();
+                        if let Some(preview) = self.workbench.preview() {
+                            self.histogram.update(&preview);
+                            ui.heading("Histogram");
+                            draw_histogram(ui, &self.histogram.histogram);
+                        }
+                        ui.separator();
+                        egui::CollapsingHeader::new("Stitch settings")
+                            .default_open(false)
+                            .show(ui, |ui| self.settings(ui));
+                        egui::CollapsingHeader::new("Diagnostics")
+                            .default_open(true)
+                            .show(ui, |ui| self.diagnostics(ui));
+                    });
             });
         egui::CentralPanel::default().show(ui, |ui| {
             if self.gpu_available {
@@ -1480,6 +1543,19 @@ impl eframe::App for ScanToImgApp {
             }
         });
     }
+}
+
+fn metadata_field(ui: &mut egui::Ui, label: &str, hint: &str, value: &mut String) -> bool {
+    ui.label(label);
+    let changed = ui
+        .add(
+            egui::TextEdit::singleline(value)
+                .desired_width(160.0)
+                .hint_text(hint),
+        )
+        .changed();
+    ui.end_row();
+    changed
 }
 
 fn decompose_placement(

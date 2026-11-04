@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use crate::features::{FeatureMatch, FeatureSet};
 use crate::image::{GrayImage, RgbaImage};
+use crate::metadata::PhotoMetadata;
 use crate::project::ImageLocator;
 use crate::stitch::{HomographyEstimate, StitchOptions, StitchProgress, WarpLayer, WarpOptions};
 use crate::CoreResult;
@@ -24,6 +25,17 @@ pub struct LoadedImage {
 pub trait ImageRepository: Send + Sync {
     fn load(&self, locator: &ImageLocator) -> CoreResult<LoadedImage>;
     fn save(&self, locator: &ImageLocator, image: &RgbaImage) -> CoreResult<()>;
+
+    /// Saves an image and embeds descriptive metadata when the format supports it.
+    fn save_with_metadata(
+        &self,
+        locator: &ImageLocator,
+        image: &RgbaImage,
+        metadata: Option<&PhotoMetadata>,
+    ) -> CoreResult<()> {
+        let _ = metadata;
+        self.save(locator, image)
+    }
 }
 
 /// Detects scale-space features. Production: SIFT. Tests: deterministic fakes.

@@ -8,8 +8,8 @@ use nalgebra::DMatrix;
 use stitch_domain::{
     Clock, Compositor, CoreError, CoreResult, Descriptor, Feature, FeatureExtractor, FeatureMatch,
     FeatureMatcher, FeatureSet, GrayImage, Homography, HomographyEstimate, HomographyEstimator,
-    ImageLocator, ImageRepository, Keypoint, LoadedImage, Point, Renderer, RgbaImage, SourceImage,
-    StitchOptions, WarpLayer, WarpOptions,
+    ImageLocator, ImageRepository, Keypoint, LoadedImage, PhotoMetadata, Point, Renderer,
+    RgbaImage, SourceImage, StitchOptions, WarpLayer, WarpOptions,
 };
 
 use crate::fixtures::SplitMix64;
@@ -19,6 +19,7 @@ use crate::fixtures::SplitMix64;
 pub struct InMemoryImageRepository {
     images: Mutex<HashMap<String, LoadedImage>>,
     saved: Mutex<Vec<String>>,
+    metadata: Mutex<HashMap<String, PhotoMetadata>>,
 }
 
 impl InMemoryImageRepository {
@@ -62,6 +63,10 @@ impl InMemoryImageRepository {
             .get(name)
             .map(|loaded| loaded.image.clone())
     }
+
+    pub fn stored_metadata(&self, name: &str) -> Option<PhotoMetadata> {
+        self.metadata.lock().unwrap().get(name).cloned()
+    }
 }
 
 impl ImageRepository for InMemoryImageRepository {
@@ -88,6 +93,26 @@ impl ImageRepository for InMemoryImageRepository {
             },
         );
         Ok(())
+    }
+
+    fn save_with_metadata(
+        &self,
+        locator: &ImageLocator,
+        image: &RgbaImage,
+        metadata: Option<&PhotoMetadata>,
+    ) -> CoreResult<()> {
+        let name = locator.as_str().to_owned();
+        let mut stored = self.metadata.lock().unwrap();
+        match metadata {
+            Some(metadata) => {
+                stored.insert(name, metadata.clone());
+            }
+            None => {
+                stored.remove(&name);
+            }
+        }
+        drop(stored);
+        self.save(locator, image)
     }
 }
 
