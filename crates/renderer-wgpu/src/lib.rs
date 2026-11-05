@@ -207,10 +207,11 @@ impl PreviewRenderer {
         revision: u64,
     ) {
         let upload = if image.width().max(image.height()) > self.max_texture_dimension {
-            image.resized_to_fit(self.max_texture_dimension)
+            Some(image.resized_to_fit(self.max_texture_dimension))
         } else {
-            image.as_ref().clone()
+            None
         };
+        let upload = upload.as_ref().unwrap_or(image.as_ref());
         let width = upload.width();
         let height = upload.height();
 

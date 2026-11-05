@@ -8,6 +8,7 @@ description = "Domain model and ports for scan-to-img"
 
 [dependencies]
 thiserror.workspace = true
+rayon.workspace = true
 
 [lints.rust]
 unsafe_code = "forbid"

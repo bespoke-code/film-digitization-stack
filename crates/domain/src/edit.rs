@@ -5,7 +5,12 @@
 
 use std::borrow::Cow;
 
+use rayon::prelude::*;
+
 use crate::image::RgbaImage;
+
+/// Below this many pixels the thread-pool overhead outweighs the parallelism.
+const PARALLEL_PIXEL_THRESHOLD: usize = 1 << 16;
 
 /// Input and output range for one channel.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -134,6 +139,11 @@ impl ToneCurve {
 
     /// Evaluates the curve with monotone cubic Hermite interpolation.
     pub fn evaluate(&self, x: f32) -> f32 {
+        self.evaluate_with(x, &self.tangents())
+    }
+
+    /// Evaluates the curve with tangents that the caller computed once.
+    fn evaluate_with(&self, x: f32, tangents: &[f32]) -> f32 {
         let x = x.clamp(0.0, 1.0);
         let points = &self.points;
         let last = points.len() - 1;
@@ -155,7 +165,6 @@ impl ToneCurve {
             return p1.y;
         }
 
-        let tangents = self.tangents();
         let t = (x - p0.x) / h;
         let t2 = t * t;
         let t3 = t2 * t;
@@ -323,7 +332,7 @@ impl Default for EditSettings {
 impl EditSettings {
     pub fn sanitized(mut self) -> Self {
         self.exposure = self.exposure.clamp(-6.0, 6.0);
-        self.contrast = self.contrast.clamp(-0.95, 0.95);
+        self.contrast = self.contrast.clamp(-1.0, 1.0);
         self.levels = self.levels.sanitized();
         self.curves = self.curves.sanitized();
         self.rotation = normalized_rotation(self.rotation);
@@ -331,6 +340,10 @@ impl EditSettings {
     }
 
     pub fn is_identity(&self) -> bool {
+        self.tone_is_identity() && self.crop.is_none() && rotation_is_identity(self.rotation)
+    }
+
+    fn tone_is_identity(&self) -> bool {
         !self.invert
             && !self.monochrome
             && self.film_base.is_none()
@@ -338,8 +351,6 @@ impl EditSettings {
             && self.contrast.abs() <= f32::EPSILON
             && self.levels.is_identity()
             && self.curves.is_identity()
-            && self.crop.is_none()
-            && rotation_is_identity(self.rotation)
     }
 
     /// Applies all adjustments at full resolution.
@@ -349,6 +360,12 @@ impl EditSettings {
         }
         let prepared = self.prepared(image);
         self.develop_exact(prepared.as_ref())
+    }
+
+    /// Applies tone and color adjustments to an image that is already prepared
+    /// for display. Rotation and cropping are ignored.
+    pub fn develop_tone(&self, image: &RgbaImage) -> RgbaImage {
+        self.develop_exact(image)
     }
 
     /// Applies all adjustments and limits the longest side for display.
@@ -388,7 +405,7 @@ impl EditSettings {
     }
 
     fn develop_exact(&self, image: &RgbaImage) -> RgbaImage {
-        if self.is_identity() {
+        if self.tone_is_identity() {
             return image.clone();
         }
         let settings = self.clone().sanitized();
@@ -397,27 +414,41 @@ impl EditSettings {
             channel_lut(&settings, 1),
             channel_lut(&settings, 2),
         ];
-        let gray_lut = gray_lut(&settings.levels.gray, &settings.curves.gray);
+        let gray_lut = settings
+            .monochrome
+            .then(|| gray_lut(&settings.levels.gray, &settings.curves.gray));
         let mut pixels = image.pixels().to_vec();
-        for chunk in pixels.as_chunks_mut::<4>().0 {
-            let r = luts[0][chunk[0] as usize];
-            let g = luts[1][chunk[1] as usize];
-            let b = luts[2][chunk[2] as usize];
-            if settings.monochrome {
-                let luma = (0.2126 * r as f32 + 0.7152 * g as f32 + 0.0722 * b as f32)
-                    .round()
-                    .clamp(0.0, 255.0) as usize;
-                let value = gray_lut[luma];
+        let row_bytes = image.width() as usize * 4;
+        let apply = |row: &mut [u8]| apply_luts(row, &luts, gray_lut.as_ref());
+        if pixels.len() >= PARALLEL_PIXEL_THRESHOLD {
+            pixels.par_chunks_mut(row_bytes).for_each(apply);
+        } else {
+            pixels.chunks_mut(row_bytes).for_each(apply);
+        }
+        RgbaImage::new(image.width(), image.height(), pixels).expect("developed image keeps size")
+    }
+}
+
+fn apply_luts(row: &mut [u8], luts: &[[u8; 256]; 3], gray_lut: Option<&[u8; 256]>) {
+    for chunk in row.as_chunks_mut::<4>().0 {
+        let r = luts[0][chunk[0] as usize];
+        let g = luts[1][chunk[1] as usize];
+        let b = luts[2][chunk[2] as usize];
+        match gray_lut {
+            Some(gray_lut) => {
+                // Fixed-point Rec. 709 weights: 0.2126/0.7152/0.0722 scaled by 2^16.
+                let luma = (13933 * r as u32 + 46871 * g as u32 + 4732 * b as u32) >> 16;
+                let value = gray_lut[luma as usize];
                 chunk[0] = value;
                 chunk[1] = value;
                 chunk[2] = value;
-            } else {
+            }
+            None => {
                 chunk[0] = r;
                 chunk[1] = g;
                 chunk[2] = b;
             }
         }
-        RgbaImage::new(image.width(), image.height(), pixels).expect("developed image keeps size")
     }
 }
 
@@ -466,7 +497,9 @@ pub fn suggest_film_base(image: &RgbaImage) -> [u8; 3] {
 fn channel_lut(settings: &EditSettings, channel: usize) -> [u8; 256] {
     let base = settings.film_base.map(|base| base[channel] as f32 / 255.0);
     let exposure = 2f32.powf(settings.exposure);
-    let contrast = ((1.0 + settings.contrast) / (1.0 - settings.contrast)).clamp(0.01, 100.0);
+    // Three stops of slope keeps every slider step visually even, including
+    // at the ends of the range.
+    let contrast = 2f32.powf(3.0 * settings.contrast);
     let levels = match channel {
         0 => settings.levels.red,
         1 => settings.levels.green,
@@ -477,6 +510,8 @@ fn channel_lut(settings: &EditSettings, channel: usize) -> [u8; 256] {
         1 => &settings.curves.green,
         _ => &settings.curves.blue,
     };
+    let tangents = curve.tangents();
+    let rgb_tangents = settings.curves.rgb.tangents();
     let mut lut = [0u8; 256];
     for (value, slot) in lut.iter_mut().enumerate() {
         let mut normalized = value as f32 / 255.0;
@@ -489,25 +524,182 @@ fn channel_lut(settings: &EditSettings, channel: usize) -> [u8; 256] {
         normalized = (normalized - 0.5) * contrast + 0.5;
         normalized *= exposure;
         normalized = levels.apply(normalized);
-        normalized = curve.evaluate(normalized);
-        normalized = settings.curves.rgb.evaluate(normalized);
+        normalized = curve.evaluate_with(normalized, &tangents);
+        normalized = settings.curves.rgb.evaluate_with(normalized, &rgb_tangents);
         *slot = (normalized.clamp(0.0, 1.0) * 255.0).round() as u8;
     }
     lut
 }
 
 fn gray_lut(levels: &ChannelLevels, curve: &ToneCurve) -> [u8; 256] {
+    let tangents = curve.tangents();
     let mut lut = [0u8; 256];
     for (value, slot) in lut.iter_mut().enumerate() {
         let normalized = levels.apply(value as f32 / 255.0);
-        *slot = (curve.evaluate(normalized).clamp(0.0, 1.0) * 255.0).round() as u8;
+        *slot = (curve.evaluate_with(normalized, &tangents).clamp(0.0, 1.0) * 255.0).round() as u8;
     }
     lut
 }
 
 #[cfg(test)]
 mod tests {
+    use std::hint::black_box;
+    use std::time::{Duration, Instant};
+
     use super::*;
+
+    /// One display frame at 60 Hz.
+    const FRAME_BUDGET: Duration = Duration::from_micros(16_667);
+
+    fn patterned_image(width: u32, height: u32) -> RgbaImage {
+        RgbaImage::from_fn(width, height, |x, y| {
+            let noise = x.wrapping_mul(31) ^ y.wrapping_mul(17);
+            [noise as u8, (noise >> 8) as u8, (noise >> 16) as u8, 255]
+        })
+    }
+
+    fn representative_settings(contrast: f32, exposure: f32) -> EditSettings {
+        EditSettings {
+            invert: true,
+            monochrome: true,
+            film_base: Some([190, 140, 100]),
+            exposure,
+            contrast,
+            levels: Levels {
+                red: ChannelLevels {
+                    black: 0.03,
+                    white: 0.92,
+                    gamma: 1.05,
+                },
+                ..Levels::default()
+            },
+            ..EditSettings::default()
+        }
+    }
+
+    fn best_of(samples: usize, mut run: impl FnMut()) -> Duration {
+        run();
+        (0..samples)
+            .map(|_| {
+                let start = Instant::now();
+                run();
+                start.elapsed()
+            })
+            .min()
+            .unwrap_or_default()
+    }
+
+    #[test]
+    #[ignore = "performance test; run with `just perf`"]
+    fn preview_tone_adjustments_render_within_a_frame() {
+        let image = patterned_image(3072, 2048);
+        let settings = representative_settings(0.3, 0.35);
+        let best = best_of(6, || {
+            black_box(settings.develop_preview(&image, 3072));
+        });
+        assert!(
+            best < FRAME_BUDGET,
+            "tone preview took {best:?}, above the {FRAME_BUDGET:?} frame budget"
+        );
+    }
+
+    #[test]
+    fn a_fine_exposure_step_changes_a_pixel_by_at_most_one_level() {
+        let image = RgbaImage::filled(1, 1, [128, 128, 128, 255]);
+        let base = EditSettings::default().develop(&image).pixel(0, 0)[0];
+        let nudged = EditSettings {
+            exposure: 0.01,
+            ..EditSettings::default()
+        }
+        .develop(&image)
+        .pixel(0, 0)[0];
+        assert!(base.abs_diff(nudged) <= 1);
+    }
+
+    #[test]
+    fn a_fine_contrast_step_stays_near_the_original() {
+        let image = RgbaImage::from_fn(256, 1, |x, _| [x as u8, x as u8, x as u8, 255]);
+        let base = EditSettings {
+            contrast: 1.0,
+            ..EditSettings::default()
+        }
+        .develop(&image);
+        let nudged = EditSettings {
+            contrast: 0.995,
+            ..EditSettings::default()
+        }
+        .develop(&image);
+        let worst = base
+            .pixels()
+            .iter()
+            .zip(nudged.pixels())
+            .map(|(a, b)| a.abs_diff(*b))
+            .max()
+            .unwrap_or(0);
+        assert!(worst <= 8, "contrast step moved a channel by {worst}");
+    }
+
+    #[test]
+    fn a_fine_levels_step_changes_a_pixel_by_at_most_one_level() {
+        let image = RgbaImage::from_fn(256, 1, |x, _| [x as u8, x as u8, x as u8, 255]);
+        for (before, after) in [
+            (
+                ChannelLevels {
+                    black: 0.2,
+                    ..ChannelLevels::default()
+                },
+                ChannelLevels {
+                    black: 0.201,
+                    ..ChannelLevels::default()
+                },
+            ),
+            (
+                ChannelLevels {
+                    white: 0.8,
+                    ..ChannelLevels::default()
+                },
+                ChannelLevels {
+                    white: 0.799,
+                    ..ChannelLevels::default()
+                },
+            ),
+            (
+                ChannelLevels {
+                    gamma: 1.0,
+                    ..ChannelLevels::default()
+                },
+                ChannelLevels {
+                    gamma: 1.001,
+                    ..ChannelLevels::default()
+                },
+            ),
+        ] {
+            let first = EditSettings {
+                levels: Levels {
+                    red: before,
+                    ..Levels::default()
+                },
+                ..EditSettings::default()
+            }
+            .develop(&image);
+            let second = EditSettings {
+                levels: Levels {
+                    red: after,
+                    ..Levels::default()
+                },
+                ..EditSettings::default()
+            }
+            .develop(&image);
+            let worst = first
+                .pixels()
+                .iter()
+                .zip(second.pixels())
+                .map(|(a, b)| a.abs_diff(*b))
+                .max()
+                .unwrap_or(0);
+            assert!(worst <= 1, "levels step moved a channel by {worst}");
+        }
+    }
 
     #[test]
     fn inversion_flips_the_value() {

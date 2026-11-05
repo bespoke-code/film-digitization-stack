@@ -59,7 +59,8 @@ opening them in the app.
 ## Development
 
 ```sh
-just check   # formatting, clippy and tests
+just check   # formatting, clippy, tests and real-time preview budgets
+just perf    # performance tests only
 just build   # release binary
 ```
 

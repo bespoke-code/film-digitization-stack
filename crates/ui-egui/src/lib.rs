@@ -178,6 +178,13 @@ enum LevelChannel {
 /// Default horizontal overlap when a rough layout starts.
 const ARRANGE_OVERLAP: f32 = 0.15;
 
+/// Smallest useful adjustment for each tone control.
+const EXPOSURE_RANGE: f32 = 6.0;
+const EXPOSURE_STEP: f64 = 0.01;
+const CONTRAST_STEP: f64 = 0.005;
+const LEVEL_STEP: f64 = 0.001;
+const GAMMA_STEP: f64 = 0.001;
+
 struct ArrangeItem {
     id: ImageId,
     name: String,
@@ -859,10 +866,24 @@ impl ScanToImgApp {
         }
 
         changed |= ui
-            .add(egui::Slider::new(&mut edits.exposure, -6.0..=6.0).text("Exposure (EV)"))
+            .add(
+                egui::Slider::new(&mut edits.exposure, -EXPOSURE_RANGE..=EXPOSURE_RANGE)
+                    .text("Exposure (EV)")
+                    .fixed_decimals(2)
+                    .step_by(EXPOSURE_STEP)
+                    .drag_value_speed(EXPOSURE_STEP),
+            )
+            .on_hover_text("Arrow keys move 0.01 EV. Drag or type the value for fine control.")
             .changed();
         changed |= ui
-            .add(egui::Slider::new(&mut edits.contrast, -0.95..=0.95).text("Contrast"))
+            .add(
+                egui::Slider::new(&mut edits.contrast, -1.0..=1.0)
+                    .text("Contrast")
+                    .fixed_decimals(3)
+                    .step_by(CONTRAST_STEP)
+                    .drag_value_speed(CONTRAST_STEP),
+            )
+            .on_hover_text("Arrow keys move 0.005. Drag or type the value for fine control.")
             .changed();
 
         ui.horizontal(|ui| {
@@ -1213,18 +1234,31 @@ impl ScanToImgApp {
             .add(
                 egui::Slider::new(&mut levels.black, 0.0..=0.9)
                     .text("Black")
-                    .fixed_decimals(3),
+                    .fixed_decimals(3)
+                    .step_by(LEVEL_STEP)
+                    .drag_value_speed(LEVEL_STEP),
             )
+            .on_hover_text("Arrow keys move 0.001. Drag or type the value for fine control.")
             .changed();
         changed |= ui
             .add(
                 egui::Slider::new(&mut levels.white, 0.1..=1.0)
                     .text("White")
-                    .fixed_decimals(3),
+                    .fixed_decimals(3)
+                    .step_by(LEVEL_STEP)
+                    .drag_value_speed(LEVEL_STEP),
             )
+            .on_hover_text("Arrow keys move 0.001. Drag or type the value for fine control.")
             .changed();
         changed |= ui
-            .add(egui::Slider::new(&mut levels.gamma, 0.1..=4.0).text("Gamma"))
+            .add(
+                egui::Slider::new(&mut levels.gamma, 0.1..=4.0)
+                    .text("Gamma")
+                    .fixed_decimals(3)
+                    .step_by(GAMMA_STEP)
+                    .drag_value_speed(GAMMA_STEP),
+            )
+            .on_hover_text("Arrow keys move 0.001. Drag or type the value for fine control.")
             .changed();
 
         let curve = match self.level_channel {
@@ -2049,5 +2083,84 @@ fn draw_histogram(ui: &mut egui::Ui, histogram: &Histogram) {
     for (values, color) in channels {
         let points: Vec<egui::Pos2> = (0..256).map(|bin| to_screen(bin, values[bin])).collect();
         painter.add(egui::Shape::line(points, egui::Stroke::new(1.0_f32, color)));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn developed(settings: EditSettings) -> RgbaImage {
+        let image = RgbaImage::from_fn(256, 1, |x, _| [x as u8, x as u8, x as u8, 255]);
+        settings.develop(&image)
+    }
+
+    fn worst_channel_change(first: &RgbaImage, second: &RgbaImage) -> u8 {
+        first
+            .pixels()
+            .iter()
+            .zip(second.pixels())
+            .map(|(a, b)| a.abs_diff(*b))
+            .max()
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn exposure_slider_steps_are_visually_small() {
+        let before = developed(EditSettings::default());
+        let after = developed(EditSettings {
+            exposure: EXPOSURE_STEP as f32,
+            ..EditSettings::default()
+        });
+        assert!(
+            worst_channel_change(&before, &after) <= 2,
+            "one exposure step moves a channel too far"
+        );
+    }
+
+    #[test]
+    fn contrast_slider_steps_are_visually_small_at_the_extremes() {
+        let before = developed(EditSettings {
+            contrast: 1.0,
+            ..EditSettings::default()
+        });
+        let after = developed(EditSettings {
+            contrast: 1.0 - CONTRAST_STEP as f32,
+            ..EditSettings::default()
+        });
+        assert!(
+            worst_channel_change(&before, &after) <= 8,
+            "one contrast step moves a channel too far"
+        );
+    }
+
+    #[test]
+    fn levels_and_gamma_slider_steps_are_sub_level() {
+        let before = developed(EditSettings {
+            levels: stitch_domain::Levels {
+                red: stitch_domain::ChannelLevels {
+                    black: 0.2,
+                    white: 0.8,
+                    gamma: 1.0,
+                },
+                ..stitch_domain::Levels::default()
+            },
+            ..EditSettings::default()
+        });
+        let after = developed(EditSettings {
+            levels: stitch_domain::Levels {
+                red: stitch_domain::ChannelLevels {
+                    black: 0.2 + LEVEL_STEP as f32,
+                    white: 0.8,
+                    gamma: 1.0 + GAMMA_STEP as f32,
+                },
+                ..stitch_domain::Levels::default()
+            },
+            ..EditSettings::default()
+        });
+        assert!(
+            worst_channel_change(&before, &after) <= 2,
+            "one levels or gamma step moves a channel too far"
+        );
     }
 }

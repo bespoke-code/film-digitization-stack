@@ -11,9 +11,9 @@ use std::sync::Arc;
 
 use stitch_application::{ProjectService, StitchService};
 use stitch_domain::{
-    suggest_film_base, CoreError, CoreResult, EditSettings, Homography, ImageId, ImageLocator,
-    PhotoMetadata, Project, RgbaImage, SourceImage, StitchOptions, StitchProgress, StitchResult,
-    StitchStage, MAX_IMAGES,
+    suggest_film_base, CoreError, CoreResult, CropRect, EditSettings, Homography, ImageId,
+    ImageLocator, PhotoMetadata, Project, RgbaImage, SourceImage, StitchOptions, StitchProgress,
+    StitchResult, StitchStage, MAX_IMAGES,
 };
 
 /// Longest side used for an edited preview.
@@ -81,6 +81,16 @@ struct PreviewCache {
     image: Arc<RgbaImage>,
 }
 
+/// Geometry-dependent preview base, reused while only tone controls change.
+#[derive(Clone, Debug)]
+struct PreviewBaseCache {
+    source: Arc<RgbaImage>,
+    rotation: f32,
+    crop: Option<CropRect>,
+    image: Arc<RgbaImage>,
+    target: PreviewTarget,
+}
+
 /// The UI-agnostic application state machine.
 #[derive(Clone, Debug)]
 pub struct Workbench {
@@ -98,6 +108,7 @@ pub struct Workbench {
     manual: HashMap<ImageId, Homography>,
     show_edits: bool,
     preview_cache: RefCell<Option<PreviewCache>>,
+    preview_base_cache: RefCell<Option<PreviewBaseCache>>,
 }
 
 impl Default for Workbench {
@@ -123,6 +134,7 @@ impl Workbench {
             manual: HashMap::new(),
             show_edits: true,
             preview_cache: RefCell::new(None),
+            preview_base_cache: RefCell::new(None),
         }
     }
 
@@ -556,7 +568,8 @@ impl Workbench {
                     });
                 }
             }
-            let developed = Arc::new(settings.develop_preview(&base, PREVIEW_DIMENSION));
+            let prepared = self.preview_base(&base, &settings);
+            let developed = Arc::new(settings.develop_tone(&prepared));
             *self.preview_cache.borrow_mut() = Some(PreviewCache {
                 revision: self.revision,
                 target: self.preview_target,
@@ -571,6 +584,30 @@ impl Workbench {
             label,
             revision: self.revision,
         })
+    }
+
+    /// Rotation, crop and fitting are expensive but do not change while a tone
+    /// slider moves, so the result is cached per source image and geometry.
+    fn preview_base(&self, base: &Arc<RgbaImage>, settings: &EditSettings) -> Arc<RgbaImage> {
+        if let Some(cache) = self.preview_base_cache.borrow().as_ref() {
+            if cache.target == self.preview_target
+                && Arc::ptr_eq(&cache.source, base)
+                && cache.rotation.to_bits() == settings.rotation.to_bits()
+                && cache.crop == settings.crop
+            {
+                return cache.image.clone();
+            }
+        }
+        let prepared = settings.prepared(base);
+        let fitted = Arc::new(prepared.as_ref().resized_to_fit(PREVIEW_DIMENSION));
+        *self.preview_base_cache.borrow_mut() = Some(PreviewBaseCache {
+            source: base.clone(),
+            rotation: settings.rotation,
+            crop: settings.crop,
+            image: fitted.clone(),
+            target: self.preview_target,
+        });
+        fitted
     }
 
     /// Creates a snapshot for a background worker and marks the workbench busy.
@@ -788,8 +825,80 @@ fn export_stem(locator: &ImageLocator, fallback: u64) -> String {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+    use std::hint::black_box;
     use std::sync::Mutex;
+    use std::time::{Duration, Instant};
     use stitch_domain::{ImageRepository, LoadedImage};
+
+    /// One display frame at 60 Hz.
+    const FRAME_BUDGET: Duration = Duration::from_micros(16_667);
+
+    fn patterned_image(width: u32, height: u32) -> RgbaImage {
+        RgbaImage::from_fn(width, height, |x, y| {
+            let noise = x.wrapping_mul(31) ^ y.wrapping_mul(17);
+            [noise as u8, (noise >> 8) as u8, (noise >> 16) as u8, 255]
+        })
+    }
+
+    #[test]
+    #[ignore = "performance test; run with `just perf`"]
+    fn repeated_tone_slider_changes_render_within_a_frame() {
+        let repo = Arc::new(MemoryRepo::default());
+        let name = "large.png".to_owned();
+        repo.images.lock().unwrap().insert(
+            name.clone(),
+            LoadedImage {
+                locator: ImageLocator::new(name.clone()),
+                name,
+                image: patterned_image(3840, 2560),
+                thumbnail: RgbaImage::filled(20, 15, [0, 0, 0, 255]),
+                metadata: PhotoMetadata::default(),
+            },
+        );
+        let mut workbench = Workbench::new();
+        let service = ProjectService::new(repo);
+        workbench
+            .add_images(&service, &[ImageLocator::new("large.png")])
+            .unwrap();
+        let id = workbench.selected().unwrap();
+
+        let render = |workbench: &mut Workbench, exposure: f32| {
+            workbench.update_edits(
+                id,
+                EditSettings {
+                    invert: true,
+                    film_base: Some([190, 140, 100]),
+                    exposure,
+                    contrast: 0.3,
+                    levels: stitch_domain::Levels {
+                        red: stitch_domain::ChannelLevels {
+                            black: 0.03,
+                            white: 0.92,
+                            gamma: 1.05,
+                        },
+                        ..stitch_domain::Levels::default()
+                    },
+                    ..EditSettings::default()
+                },
+            );
+            black_box(workbench.preview());
+        };
+
+        // The first render includes the one-off rotation, crop and downscale.
+        render(&mut workbench, 0.35);
+        let best = (0..6)
+            .map(|sample| {
+                let start = Instant::now();
+                render(&mut workbench, 0.35 + sample as f32 * 0.01);
+                start.elapsed()
+            })
+            .min()
+            .unwrap_or_default();
+        assert!(
+            best < FRAME_BUDGET,
+            "tone preview took {best:?}, above the {FRAME_BUDGET:?} frame budget"
+        );
+    }
 
     #[derive(Default)]
     struct MemoryRepo {

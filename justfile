@@ -18,6 +18,10 @@ lint:
 test:
     cargo test --workspace
 
+# Enforce the real-time preview budgets with release optimization.
+perf:
+    cargo test --release -p stitch-domain -p stitch-ui-core --lib -- --ignored --test-threads=1 --nocapture
+
 # Build the release binary.
 build:
     cargo build --release
@@ -27,4 +31,4 @@ run:
     cargo run --release -p scan-to-img
 
 # Full local pipeline.
-check: fmt-check lint test
+check: fmt-check lint test perf
