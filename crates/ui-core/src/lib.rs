@@ -62,6 +62,27 @@ pub struct PreviewInfo {
     pub revision: u64,
 }
 
+/// Preview of the rotated source before cropping, for the crop viewport.
+#[derive(Clone, Debug)]
+pub struct CropPreview {
+    pub image: Arc<RgbaImage>,
+    pub label: String,
+    pub revision: u64,
+    /// Full pixel size of the rotated source.
+    pub source_width: u32,
+    pub source_height: u32,
+}
+
+impl CropPreview {
+    pub fn info(&self) -> PreviewInfo {
+        PreviewInfo {
+            image: self.image.clone(),
+            label: self.label.clone(),
+            revision: self.revision,
+        }
+    }
+}
+
 /// An immutable job handed to a background worker.
 #[derive(Clone, Debug)]
 pub struct StitchJob {
@@ -91,6 +112,18 @@ struct PreviewBaseCache {
     target: PreviewTarget,
 }
 
+/// Downscaled, rotated source for the interactive crop viewport.
+#[derive(Clone, Debug)]
+struct CropPreviewCache {
+    source: Arc<RgbaImage>,
+    base: Arc<RgbaImage>,
+    rotation: f32,
+    image: Arc<RgbaImage>,
+    source_width: u32,
+    source_height: u32,
+    target: PreviewTarget,
+}
+
 /// The UI-agnostic application state machine.
 #[derive(Clone, Debug)]
 pub struct Workbench {
@@ -109,6 +142,7 @@ pub struct Workbench {
     show_edits: bool,
     preview_cache: RefCell<Option<PreviewCache>>,
     preview_base_cache: RefCell<Option<PreviewBaseCache>>,
+    crop_preview_cache: RefCell<Option<CropPreviewCache>>,
 }
 
 impl Default for Workbench {
@@ -135,6 +169,7 @@ impl Workbench {
             show_edits: true,
             preview_cache: RefCell::new(None),
             preview_base_cache: RefCell::new(None),
+            crop_preview_cache: RefCell::new(None),
         }
     }
 
@@ -179,6 +214,73 @@ impl Workbench {
             image,
             label,
             revision: self.revision,
+        })
+    }
+
+    /// The rotated source without cropping, downscaled for the crop viewport.
+    ///
+    /// The full rotated dimensions are returned so the UI can turn a
+    /// normalized selection into source-pixel crop coordinates.
+    pub fn crop_preview(&self) -> Option<CropPreview> {
+        let (base, label) = self.base_image()?;
+        let rotation = self.current_edits().rotation;
+        let cached = {
+            let cache = self.crop_preview_cache.borrow();
+            cache
+                .as_ref()
+                .filter(|cache| {
+                    cache.target == self.preview_target && Arc::ptr_eq(&cache.source, &base)
+                })
+                .map(|cache| {
+                    (
+                        cache.base.clone(),
+                        cache.rotation,
+                        cache.image.clone(),
+                        cache.source_width,
+                        cache.source_height,
+                    )
+                })
+        };
+        let (image, source_width, source_height) = match cached {
+            Some((_, cached_rotation, cached_image, width, height))
+                if cached_rotation.to_bits() == rotation.to_bits() =>
+            {
+                (cached_image, width, height)
+            }
+            Some((cached_base, _, _, _, _)) => {
+                let (image, width, height) = rotated_crop_image(&cached_base, &base, rotation);
+                *self.crop_preview_cache.borrow_mut() = Some(CropPreviewCache {
+                    source: base.clone(),
+                    base: cached_base,
+                    rotation,
+                    image: image.clone(),
+                    source_width: width,
+                    source_height: height,
+                    target: self.preview_target,
+                });
+                (image, width, height)
+            }
+            None => {
+                let fitted = Arc::new(base.resized_to_fit(PREVIEW_DIMENSION));
+                let (image, width, height) = rotated_crop_image(&fitted, &base, rotation);
+                *self.crop_preview_cache.borrow_mut() = Some(CropPreviewCache {
+                    source: base.clone(),
+                    base: fitted,
+                    rotation,
+                    image: image.clone(),
+                    source_width: width,
+                    source_height: height,
+                    target: self.preview_target,
+                });
+                (image, width, height)
+            }
+        };
+        Some(CropPreview {
+            image,
+            label,
+            revision: self.revision,
+            source_width,
+            source_height,
         })
     }
 
@@ -813,6 +915,21 @@ impl Workbench {
     }
 }
 
+fn rotated_crop_image(
+    fitted: &Arc<RgbaImage>,
+    full: &RgbaImage,
+    rotation: f32,
+) -> (Arc<RgbaImage>, u32, u32) {
+    let (source_width, source_height) =
+        RgbaImage::rotated_dimensions(full.width(), full.height(), rotation);
+    let image = if stitch_domain::rotation_is_identity(rotation) {
+        fitted.clone()
+    } else {
+        Arc::new(fitted.rotated(rotation))
+    };
+    (image, source_width, source_height)
+}
+
 fn export_stem(locator: &ImageLocator, fallback: u64) -> String {
     Path::new(locator.as_str())
         .file_stem()
@@ -838,6 +955,46 @@ mod tests {
             let noise = x.wrapping_mul(31) ^ y.wrapping_mul(17);
             [noise as u8, (noise >> 8) as u8, (noise >> 16) as u8, 255]
         })
+    }
+
+    #[test]
+    fn crop_preview_uses_rotated_dimensions_without_crop() {
+        let repo = Arc::new(MemoryRepo::default());
+        let name = "crop.png".to_owned();
+        repo.images.lock().unwrap().insert(
+            name.clone(),
+            LoadedImage {
+                locator: ImageLocator::new(name.clone()),
+                name,
+                image: patterned_image(400, 200),
+                thumbnail: RgbaImage::filled(20, 10, [0, 0, 0, 255]),
+                metadata: PhotoMetadata::default(),
+            },
+        );
+        let mut workbench = Workbench::new();
+        let service = ProjectService::new(repo);
+        workbench
+            .add_images(&service, &[ImageLocator::new("crop.png")])
+            .unwrap();
+        let id = workbench.selected().unwrap();
+        workbench.update_edits(
+            id,
+            EditSettings {
+                rotation: 90.0,
+                crop: Some(CropRect {
+                    x: 10,
+                    y: 10,
+                    width: 50,
+                    height: 50,
+                }),
+                exposure: 1.0,
+                ..EditSettings::default()
+            },
+        );
+
+        let preview = workbench.crop_preview().unwrap();
+        assert_eq!((preview.source_width, preview.source_height), (200, 400));
+        assert_eq!((preview.image.width(), preview.image.height()), (200, 400));
     }
 
     #[test]
@@ -897,6 +1054,52 @@ mod tests {
         assert!(
             best < FRAME_BUDGET,
             "tone preview took {best:?}, above the {FRAME_BUDGET:?} frame budget"
+        );
+    }
+
+    #[test]
+    #[ignore = "performance test; run with `just perf`"]
+    fn repeated_crop_preview_frames_render_within_a_frame() {
+        let repo = Arc::new(MemoryRepo::default());
+        let name = "crop-large.png".to_owned();
+        repo.images.lock().unwrap().insert(
+            name.clone(),
+            LoadedImage {
+                locator: ImageLocator::new(name.clone()),
+                name,
+                image: patterned_image(6000, 4000),
+                thumbnail: RgbaImage::filled(20, 15, [0, 0, 0, 255]),
+                metadata: PhotoMetadata::default(),
+            },
+        );
+        let mut workbench = Workbench::new();
+        let service = ProjectService::new(repo);
+        workbench
+            .add_images(&service, &[ImageLocator::new("crop-large.png")])
+            .unwrap();
+        let id = workbench.selected().unwrap();
+        workbench.update_edits(
+            id,
+            EditSettings {
+                rotation: 3.0,
+                ..EditSettings::default()
+            },
+        );
+
+        // The first frame builds the downscaled base; later frames must be
+        // immediate while the user drags crop handles.
+        black_box(workbench.crop_preview());
+        let best = (0..6)
+            .map(|_| {
+                let start = Instant::now();
+                black_box(workbench.crop_preview());
+                start.elapsed()
+            })
+            .min()
+            .unwrap_or_default();
+        assert!(
+            best < FRAME_BUDGET,
+            "crop preview took {best:?}, above the {FRAME_BUDGET:?} frame budget"
         );
     }
 

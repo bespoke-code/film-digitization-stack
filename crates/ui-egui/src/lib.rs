@@ -185,6 +185,35 @@ const CONTRAST_STEP: f64 = 0.005;
 const LEVEL_STEP: f64 = 0.001;
 const GAMMA_STEP: f64 = 0.001;
 
+/// Visual size of the crop handles and the thinnest usable border.
+const CROP_HANDLE_RADIUS: f32 = 7.0;
+const CROP_HANDLE_SIZE: f32 = 6.0;
+const CROP_MIN_SIZE: f32 = 12.0;
+
+/// A crop selection in normalized image coordinates.
+type CropDraft = egui::Rect;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CropHandle {
+    New,
+    Move,
+    NorthWest,
+    North,
+    NorthEast,
+    East,
+    SouthEast,
+    South,
+    SouthWest,
+    West,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct CropDrag {
+    handle: CropHandle,
+    origin: CropDraft,
+    anchor: egui::Pos2,
+}
+
 struct ArrangeItem {
     id: ImageId,
     name: String,
@@ -329,8 +358,8 @@ pub struct ScanToImgApp {
     tone_open: bool,
     curve_drag: Option<usize>,
     crop_mode: bool,
-    crop_start: Option<egui::Pos2>,
-    crop_end: Option<egui::Pos2>,
+    crop_draft: Option<CropDraft>,
+    crop_drag: Option<CropDrag>,
     arrange_open: bool,
     arrange: Option<ArrangeState>,
 }
@@ -369,8 +398,8 @@ impl ScanToImgApp {
             tone_open: false,
             curve_drag: None,
             crop_mode: false,
-            crop_start: None,
-            crop_end: None,
+            crop_draft: None,
+            crop_drag: None,
             arrange_open: false,
             arrange: None,
         }
@@ -826,7 +855,7 @@ impl ScanToImgApp {
 
     fn develop(&mut self, ui: &mut egui::Ui) {
         ui.heading("Develop");
-        if self.workbench.base_preview().is_none() {
+        if !self.workbench.has_preview() {
             ui.weak("Select an image or stitch a panorama to edit it.");
             return;
         }
@@ -930,27 +959,53 @@ impl ScanToImgApp {
         ui.horizontal(|ui| {
             if ui
                 .selectable_label(self.crop_mode, "Crop")
-                .on_hover_text("Drag a rectangle on the preview")
+                .on_hover_text("Adjust the crop on the preview, then press Apply")
                 .clicked()
             {
                 self.crop_mode = !self.crop_mode;
-                self.crop_start = None;
-                self.crop_end = None;
+                self.crop_drag = None;
                 self.picking_film_base = false;
+                self.crop_draft = if self.crop_mode {
+                    self.workbench.crop_preview().and_then(|preview| {
+                        edits.crop.map(|crop| {
+                            crop_to_normalized(crop, preview.source_width, preview.source_height)
+                        })
+                    })
+                } else {
+                    None
+                };
+                if self.crop_mode {
+                    // Build the downscaled base before the first drag so the
+                    // first click lands in an already responsive viewport.
+                    let _ = self.workbench.crop_preview();
+                }
             }
-            if edits.crop.is_some() && ui.button("Reset crop").clicked() {
+            if !self.crop_mode && edits.crop.is_some() && ui.button("Reset crop").clicked() {
                 edits.crop = None;
                 changed = true;
             }
         });
+        if self.crop_mode {
+            ui.horizontal(|ui| {
+                if ui.button("Apply crop").clicked() {
+                    self.apply_crop(&mut edits);
+                }
+                if ui.button("Cancel").clicked() {
+                    self.crop_mode = false;
+                    self.crop_draft = None;
+                    self.crop_drag = None;
+                }
+                if ui.button("Select all").clicked() {
+                    self.crop_draft = Some(full_crop());
+                }
+            });
+            ui.weak("Drag inside to move, drag a handle to resize, then Apply.");
+        }
         if let Some(crop) = edits.crop {
             ui.weak(format!(
                 "Crop {} × {} at {}, {}",
                 crop.width, crop.height, crop.x, crop.y
             ));
-        }
-        if self.crop_mode {
-            ui.weak("Drag a rectangle on the preview to crop.");
         }
         if changed {
             self.workbench.update_current_edits(edits.clone());
@@ -976,6 +1031,20 @@ impl ScanToImgApp {
         if ui.checkbox(&mut show, "Preview edits").changed() {
             self.workbench.set_show_edits(show);
         }
+    }
+
+    fn apply_crop(&mut self, edits: &mut EditSettings) {
+        if let (Some(draft), Some(preview)) = (self.crop_draft, self.workbench.crop_preview()) {
+            if let Some(crop) =
+                crop_from_normalized(draft, preview.source_width, preview.source_height)
+            {
+                edits.crop = Some(crop);
+                self.workbench.update_current_edits(edits.clone());
+            }
+        }
+        self.crop_mode = false;
+        self.crop_draft = None;
+        self.crop_drag = None;
     }
 
     fn metadata(&mut self, ui: &mut egui::Ui) {
@@ -1320,8 +1389,13 @@ impl ScanToImgApp {
     }
 
     fn preview_area(&mut self, ui: &mut egui::Ui) {
+        let crop_preview = if self.crop_mode {
+            self.workbench.crop_preview()
+        } else {
+            None
+        };
         let preview = if self.crop_mode {
-            self.workbench.base_preview()
+            crop_preview.as_ref().map(|preview| preview.info())
         } else {
             self.workbench.preview()
         };
@@ -1339,9 +1413,18 @@ impl ScanToImgApp {
             preview.image.height(),
         );
         if self.preview.key != Some(key) {
+            let target_changed = self.preview.key.map(|previous| previous.0) != Some(key.0);
             self.preview.key = Some(key);
             self.preview.zoom = 1.0;
             self.preview.pan = egui::Vec2::ZERO;
+            if self.crop_mode && target_changed {
+                self.crop_draft = crop_preview.as_ref().and_then(|preview| {
+                    self.workbench.current_edits().crop.map(|crop| {
+                        crop_to_normalized(crop, preview.source_width, preview.source_height)
+                    })
+                });
+                self.crop_drag = None;
+            }
         }
 
         ui.horizontal(|ui| {
@@ -1410,44 +1493,51 @@ impl ScanToImgApp {
         }
 
         if self.crop_mode {
-            if response.hovered() {
+            let pointer = ui.input(|input| input.pointer.latest_pos());
+            if let Some(draft) = self.crop_draft {
+                if let Some(position) = pointer {
+                    let screen = normalized_rect_to_screen(draft, image_rect);
+                    let cursor = crop_hit(screen, position)
+                        .map(crop_cursor)
+                        .unwrap_or(egui::CursorIcon::Crosshair);
+                    if response.hovered() {
+                        ui.ctx().set_cursor_icon(cursor);
+                    }
+                }
+                let rect = normalized_rect_to_screen(draft, image_rect);
+                draw_crop_rect(&painter, rect, true);
+            } else if response.hovered() {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
             }
-            if response.drag_started() {
-                self.crop_start = response
-                    .interact_pointer_pos()
-                    .filter(|position| image_rect.contains(*position));
-                self.crop_end = self.crop_start;
-            }
-            if response.dragged() && self.crop_start.is_some() {
-                self.crop_end = response.interact_pointer_pos().or(self.crop_end);
-            }
-            let existing = self.workbench.current_edits().crop;
-            if self.crop_start.is_none() {
-                if let Some(crop) = existing {
-                    let rect = crop_on_screen(crop, &preview.image, image_rect);
-                    draw_crop_rect(&painter, rect, false);
-                }
-            }
-            if let (Some(start), Some(end)) = (self.crop_start, self.crop_end) {
-                let rect = egui::Rect::from_two_pos(start, end).intersect(image_rect);
-                if rect.is_positive() {
-                    draw_crop_rect(&painter, rect, true);
-                }
-            }
-            if response.drag_stopped() {
-                let start = self.crop_start.take();
-                let end = self
-                    .crop_end
-                    .take()
-                    .or_else(|| response.interact_pointer_pos());
-                if let (Some(start), Some(end)) = (start, end) {
-                    if let Some(crop) = crop_from_screen(&preview.image, start, end, image_rect) {
-                        let mut edits = self.workbench.current_edits();
-                        edits.crop = Some(crop);
-                        self.workbench.update_current_edits(edits);
-                        self.crop_mode = false;
+
+            let pressed = response.hovered() && ui.input(|input| input.pointer.primary_pressed());
+            if pressed {
+                if let Some(position) = pointer.filter(|position| image_rect.contains(*position)) {
+                    let handle = self
+                        .crop_draft
+                        .map(|draft| normalized_rect_to_screen(draft, image_rect))
+                        .and_then(|screen| crop_hit(screen, position))
+                        .unwrap_or(CropHandle::New);
+                    let anchor = screen_to_normalized(position, image_rect);
+                    self.crop_drag = Some(CropDrag {
+                        handle,
+                        origin: self
+                            .crop_draft
+                            .unwrap_or_else(|| egui::Rect::from_min_size(anchor, egui::Vec2::ZERO)),
+                        anchor,
+                    });
+                    if handle == CropHandle::New {
+                        self.crop_draft = Some(egui::Rect::from_min_size(anchor, egui::Vec2::ZERO));
                     }
+                }
+            }
+            if let Some(drag) = self.crop_drag {
+                if ui.input(|input| input.pointer.primary_down()) {
+                    if let Some(position) = pointer {
+                        self.crop_draft = Some(update_crop_draft(drag, position, image_rect));
+                    }
+                } else {
+                    self.crop_drag = None;
                 }
             }
         } else if response.dragged() {
@@ -1550,7 +1640,12 @@ impl eframe::App for ScanToImgApp {
                         ui.separator();
                         self.metadata(ui);
                         ui.separator();
-                        if let Some(preview) = self.workbench.preview() {
+                        let histogram_preview = if self.crop_mode {
+                            self.workbench.crop_preview().map(|preview| preview.info())
+                        } else {
+                            self.workbench.preview()
+                        };
+                        if let Some(preview) = histogram_preview {
                             self.histogram.update(&preview);
                             ui.heading("Histogram");
                             draw_histogram(ui, &self.histogram.histogram);
@@ -1965,29 +2060,164 @@ fn curve_editor(
     changed
 }
 
-fn crop_from_screen(
-    image: &RgbaImage,
-    start: egui::Pos2,
-    end: egui::Pos2,
-    image_rect: egui::Rect,
+fn full_crop() -> CropDraft {
+    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0))
+}
+
+fn crop_to_normalized(
+    crop: stitch_domain::CropRect,
+    source_width: u32,
+    source_height: u32,
+) -> CropDraft {
+    let width = source_width.max(1) as f32;
+    let height = source_height.max(1) as f32;
+    egui::Rect::from_min_max(
+        egui::pos2(crop.x as f32 / width, crop.y as f32 / height),
+        egui::pos2(
+            (crop.x + crop.width) as f32 / width,
+            (crop.y + crop.height) as f32 / height,
+        ),
+    )
+}
+
+fn crop_from_normalized(
+    draft: CropDraft,
+    source_width: u32,
+    source_height: u32,
 ) -> Option<stitch_domain::CropRect> {
-    let to_image = |position: egui::Pos2| {
-        let x = ((position.x - image_rect.left()) / image_rect.width()).clamp(0.0, 1.0);
-        let y = ((position.y - image_rect.top()) / image_rect.height()).clamp(0.0, 1.0);
-        (x * image.width() as f32, y * image.height() as f32)
-    };
-    let (ax, ay) = to_image(start);
-    let (bx, by) = to_image(end);
-    let x = (ax.min(bx).round() as u32).min(image.width() - 1);
-    let y = (ay.min(by).round() as u32).min(image.height() - 1);
-    let width = ((ax - bx).abs().round() as u32).min(image.width() - x);
-    let height = ((ay - by).abs().round() as u32).min(image.height() - y);
+    let width = source_width.max(1) as f32;
+    let height = source_height.max(1) as f32;
+    let left = (draft.min.x.clamp(0.0, 1.0) * width).round() as u32;
+    let top = (draft.min.y.clamp(0.0, 1.0) * height).round() as u32;
+    let right = (draft.max.x.clamp(0.0, 1.0) * width).round() as u32;
+    let bottom = (draft.max.y.clamp(0.0, 1.0) * height).round() as u32;
+    let x = left.min(source_width.saturating_sub(1));
+    let y = top.min(source_height.saturating_sub(1));
+    let width = right.saturating_sub(x).min(source_width - x);
+    let height = bottom.saturating_sub(y).min(source_height - y);
     (width >= 8 && height >= 8).then_some(stitch_domain::CropRect {
         x,
         y,
         width,
         height,
     })
+}
+
+fn normalized_rect_to_screen(rect: CropDraft, image_rect: egui::Rect) -> egui::Rect {
+    egui::Rect::from_min_max(
+        egui::pos2(
+            image_rect.left() + rect.min.x * image_rect.width(),
+            image_rect.top() + rect.min.y * image_rect.height(),
+        ),
+        egui::pos2(
+            image_rect.left() + rect.max.x * image_rect.width(),
+            image_rect.top() + rect.max.y * image_rect.height(),
+        ),
+    )
+}
+
+fn screen_to_normalized(position: egui::Pos2, image_rect: egui::Rect) -> egui::Pos2 {
+    egui::pos2(
+        ((position.x - image_rect.left()) / image_rect.width().max(1.0)).clamp(0.0, 1.0),
+        ((position.y - image_rect.top()) / image_rect.height().max(1.0)).clamp(0.0, 1.0),
+    )
+}
+
+fn crop_handle_position(handle: CropHandle, rect: egui::Rect) -> egui::Pos2 {
+    let center = rect.center();
+    match handle {
+        CropHandle::NorthWest => rect.left_top(),
+        CropHandle::North => egui::pos2(center.x, rect.top()),
+        CropHandle::NorthEast => rect.right_top(),
+        CropHandle::East => egui::pos2(rect.right(), center.y),
+        CropHandle::SouthEast => rect.right_bottom(),
+        CropHandle::South => egui::pos2(center.x, rect.bottom()),
+        CropHandle::SouthWest => rect.left_bottom(),
+        CropHandle::West => egui::pos2(rect.left(), center.y),
+        CropHandle::Move | CropHandle::New => center,
+    }
+}
+
+fn crop_hit(rect: egui::Rect, position: egui::Pos2) -> Option<CropHandle> {
+    for handle in [
+        CropHandle::NorthWest,
+        CropHandle::North,
+        CropHandle::NorthEast,
+        CropHandle::East,
+        CropHandle::SouthEast,
+        CropHandle::South,
+        CropHandle::SouthWest,
+        CropHandle::West,
+    ] {
+        if crop_handle_position(handle, rect).distance(position) <= CROP_HANDLE_RADIUS {
+            return Some(handle);
+        }
+    }
+    rect.contains(position).then_some(CropHandle::Move)
+}
+
+fn crop_cursor(handle: CropHandle) -> egui::CursorIcon {
+    match handle {
+        CropHandle::New => egui::CursorIcon::Crosshair,
+        CropHandle::Move => egui::CursorIcon::Grab,
+        CropHandle::NorthWest | CropHandle::SouthEast => egui::CursorIcon::ResizeNwSe,
+        CropHandle::NorthEast | CropHandle::SouthWest => egui::CursorIcon::ResizeNeSw,
+        CropHandle::North | CropHandle::South => egui::CursorIcon::ResizeVertical,
+        CropHandle::East | CropHandle::West => egui::CursorIcon::ResizeHorizontal,
+    }
+}
+
+fn update_crop_draft(drag: CropDrag, pointer: egui::Pos2, image_rect: egui::Rect) -> CropDraft {
+    let pointer = screen_to_normalized(pointer, image_rect);
+    let min_width = (CROP_MIN_SIZE / image_rect.width().max(1.0)).min(0.5);
+    let min_height = (CROP_MIN_SIZE / image_rect.height().max(1.0)).min(0.5);
+    let rect = match drag.handle {
+        CropHandle::New => egui::Rect::from_two_pos(drag.anchor, pointer),
+        CropHandle::Move => {
+            let delta = pointer - drag.anchor;
+            let dx = delta.x.clamp(-drag.origin.min.x, 1.0 - drag.origin.max.x);
+            let dy = delta.y.clamp(-drag.origin.min.y, 1.0 - drag.origin.max.y);
+            drag.origin.translate(egui::vec2(dx, dy))
+        }
+        handle => {
+            let mut min = drag.origin.min;
+            let mut max = drag.origin.max;
+            if matches!(
+                handle,
+                CropHandle::NorthWest | CropHandle::West | CropHandle::SouthWest
+            ) {
+                min.x = pointer.x;
+            }
+            if matches!(
+                handle,
+                CropHandle::NorthEast | CropHandle::East | CropHandle::SouthEast
+            ) {
+                max.x = pointer.x;
+            }
+            if matches!(
+                handle,
+                CropHandle::NorthWest | CropHandle::North | CropHandle::NorthEast
+            ) {
+                min.y = pointer.y;
+            }
+            if matches!(
+                handle,
+                CropHandle::SouthWest | CropHandle::South | CropHandle::SouthEast
+            ) {
+                max.y = pointer.y;
+            }
+            egui::Rect::from_two_pos(min, max)
+        }
+    };
+    let rect = egui::Rect::from_min_max(
+        egui::pos2(rect.min.x.clamp(0.0, 1.0), rect.min.y.clamp(0.0, 1.0)),
+        egui::pos2(rect.max.x.clamp(0.0, 1.0), rect.max.y.clamp(0.0, 1.0)),
+    );
+    let width = rect.width().max(min_width);
+    let height = rect.height().max(min_height);
+    let min_x = rect.min.x.min(1.0 - width);
+    let min_y = rect.min.y.min(1.0 - height);
+    egui::Rect::from_min_size(egui::pos2(min_x, min_y), egui::vec2(width, height))
 }
 
 /// Projects the visible part of the image into the callback viewport.
@@ -2002,29 +2232,11 @@ fn rect_in_ndc(image_rect: egui::Rect, viewport: egui::Rect) -> [f32; 4] {
     ]
 }
 
-fn crop_on_screen(
-    crop: stitch_domain::CropRect,
-    image: &RgbaImage,
-    image_rect: egui::Rect,
-) -> egui::Rect {
-    let width = image.width().max(1) as f32;
-    let height = image.height().max(1) as f32;
-    let min = egui::pos2(
-        image_rect.left() + crop.x as f32 / width * image_rect.width(),
-        image_rect.top() + crop.y as f32 / height * image_rect.height(),
-    );
-    let max = egui::pos2(
-        image_rect.left() + (crop.x + crop.width) as f32 / width * image_rect.width(),
-        image_rect.top() + (crop.y + crop.height) as f32 / height * image_rect.height(),
-    );
-    egui::Rect::from_min_max(min, max)
-}
-
 fn draw_crop_rect(painter: &egui::Painter, rect: egui::Rect, active: bool) {
     if !rect.is_positive() {
         return;
     }
-    painter.rect_filled(rect, 0.0, egui::Color32::from_white_alpha(30));
+    painter.rect_filled(rect, 0.0, egui::Color32::from_white_alpha(14));
     let color = if active {
         egui::Color32::from_rgb(255, 200, 60)
     } else {
@@ -2033,9 +2245,31 @@ fn draw_crop_rect(painter: &egui::Painter, rect: egui::Rect, active: bool) {
     painter.rect_stroke(
         rect,
         0.0,
-        egui::Stroke::new(2.0_f32, color),
+        egui::Stroke::new(1.0_f32, color),
         egui::StrokeKind::Inside,
     );
+    if active {
+        for handle in [
+            CropHandle::NorthWest,
+            CropHandle::North,
+            CropHandle::NorthEast,
+            CropHandle::East,
+            CropHandle::SouthEast,
+            CropHandle::South,
+            CropHandle::SouthWest,
+            CropHandle::West,
+        ] {
+            let position = crop_handle_position(handle, rect);
+            painter.rect_filled(
+                egui::Rect::from_center_size(
+                    position,
+                    egui::vec2(CROP_HANDLE_SIZE, CROP_HANDLE_SIZE),
+                ),
+                1.0,
+                color,
+            );
+        }
+    }
 }
 
 fn draw_swatch(ui: &mut egui::Ui, color: [u8; 3]) {
@@ -2162,5 +2396,49 @@ mod tests {
             worst_channel_change(&before, &after) <= 2,
             "one levels or gamma step moves a channel too far"
         );
+    }
+
+    #[test]
+    fn crop_normalization_round_trips() {
+        let crop = stitch_domain::CropRect {
+            x: 100,
+            y: 50,
+            width: 400,
+            height: 300,
+        };
+        let draft = crop_to_normalized(crop, 1000, 600);
+        assert_eq!(crop_from_normalized(draft, 1000, 600), Some(crop));
+    }
+
+    #[test]
+    fn crop_drag_stays_inside_the_image() {
+        let image_rect =
+            egui::Rect::from_min_size(egui::pos2(10.0, 20.0), egui::vec2(200.0, 100.0));
+        let origin = egui::Rect::from_min_max(egui::pos2(0.2, 0.2), egui::pos2(0.6, 0.6));
+        let drag = CropDrag {
+            handle: CropHandle::Move,
+            origin,
+            anchor: egui::pos2(0.4, 0.4),
+        };
+        let moved = update_crop_draft(drag, egui::pos2(1000.0, -500.0), image_rect);
+        assert!(moved.min.x >= 0.0 && moved.min.y >= 0.0);
+        assert!(moved.max.x <= 1.0 && moved.max.y <= 1.0);
+        assert!((moved.width() - origin.width()).abs() <= f32::EPSILON);
+        assert!((moved.height() - origin.height()).abs() <= f32::EPSILON);
+    }
+
+    #[test]
+    fn crop_drag_can_start_from_a_click() {
+        let image_rect =
+            egui::Rect::from_min_size(egui::pos2(10.0, 20.0), egui::vec2(200.0, 100.0));
+        let anchor = screen_to_normalized(egui::pos2(60.0, 50.0), image_rect);
+        let drag = CropDrag {
+            handle: CropHandle::New,
+            origin: egui::Rect::from_min_size(anchor, egui::Vec2::ZERO),
+            anchor,
+        };
+        let draft = update_crop_draft(drag, egui::pos2(500.0, 500.0), image_rect);
+        assert!(draft.width() > 0.0 && draft.height() > 0.0);
+        assert!(draft.max.x <= 1.0 && draft.max.y <= 1.0);
     }
 }
