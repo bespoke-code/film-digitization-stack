@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use stitch_application::{ProjectService, StitchService, SystemClock};
-use stitch_imaging::{BilinearCompositor, FileImageRepository};
+use stitch_imaging::{BilinearCompositor, CacheDir, FileImageRepository};
 use stitch_ui_egui::ScanToImgApp;
 use stitch_vision::{RansacHomographyEstimator, RatioMatcher, SiftExtractor};
 
@@ -12,6 +12,18 @@ fn main() -> eframe::Result<()> {
 
     let initial_paths: Vec<std::path::PathBuf> =
         std::env::args_os().skip(1).map(Into::into).collect();
+
+    // Held until the app exits; dropping it removes the cache directory.
+    let _cache = match CacheDir::create() {
+        Ok(cache) => {
+            log::debug!("cache directory: {}", cache.path().display());
+            Some(cache)
+        }
+        Err(error) => {
+            log::warn!("could not create the cache directory: {error}");
+            None
+        }
+    };
 
     let repository = Arc::new(FileImageRepository::default());
     let project_service = ProjectService::new(repository);
@@ -27,6 +39,7 @@ fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         renderer: eframe::Renderer::Wgpu,
         multisampling: 0,
+        persist_window: false,
         viewport: eframe::egui::ViewportBuilder::default()
             .with_title("Scan to image")
             .with_inner_size([1440.0, 900.0])

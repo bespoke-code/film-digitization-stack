@@ -1,7 +1,7 @@
 //! Decode/encode images from the filesystem using the pure-Rust `image` crate.
 
-use std::io::Cursor;
-use std::path::Path;
+use std::io::{Cursor, Write};
+use std::path::{Path, PathBuf};
 
 use image::{DynamicImage, ImageFormat, RgbaImage as ImageRgbaImage};
 use stitch_domain::{
@@ -162,10 +162,77 @@ impl FileImageRepository {
                 })?;
             }
         }
-        std::fs::write(path, bytes).map_err(|error| CoreError::Io {
+        write_atomically(path, bytes).map_err(|error| CoreError::Io {
             path: path.to_string_lossy().into_owned(),
             message: error.to_string(),
         })
+    }
+}
+
+/// Writes next to the destination and renames into place so an interrupted
+/// export never leaves a partial image behind.
+fn write_atomically(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "image".to_owned());
+    let pid = std::process::id();
+    for attempt in 0..100 {
+        let temp = parent.join(format!(".{name}.{pid}-{attempt}.tmp"));
+        let mut file = match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        };
+        let mut guard = TempFileGuard::new(temp);
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(guard.path(), path)?;
+        guard.commit();
+        return Ok(());
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "could not create a unique export temporary file",
+    ))
+}
+
+struct TempFileGuard {
+    path: PathBuf,
+    committed: bool,
+}
+
+impl TempFileGuard {
+    fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            committed: false,
+        }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn commit(&mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for TempFileGuard {
+    fn drop(&mut self) {
+        if !self.committed {
+            let _ = std::fs::remove_file(&self.path);
+        }
     }
 }
 
@@ -247,6 +314,42 @@ mod tests {
             assert_eq!(loaded.metadata.camera, "Nikon FM2");
             assert_eq!(loaded.metadata.iso, "400");
         }
+    }
+
+    #[test]
+    fn save_leaves_no_temporary_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("image.png");
+        let locator = ImageLocator::new(path.to_string_lossy());
+        let image = RgbaImage::filled(8, 8, [10, 20, 30, 255]);
+        FileImageRepository::default()
+            .save(&locator, &image)
+            .unwrap();
+        let mut entries: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        entries.sort();
+        assert_eq!(entries, ["image.png"]);
+    }
+
+    #[test]
+    fn failed_write_removes_the_temporary_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("image.png");
+        std::fs::create_dir(&path).unwrap();
+        let locator = ImageLocator::new(path.to_string_lossy());
+        let image = RgbaImage::filled(8, 8, [10, 20, 30, 255]);
+        let error = FileImageRepository::default()
+            .save(&locator, &image)
+            .unwrap_err();
+        assert!(matches!(error, CoreError::Io { .. }));
+        let mut entries: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        entries.sort();
+        assert_eq!(entries, ["image.png"]);
     }
 
     #[test]
