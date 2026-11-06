@@ -56,7 +56,8 @@ Source files are never modified.
 
 Exports are written atomically, so an interrupted save never leaves a partial
 image. The app keeps temporary files in an app-owned directory that is removed
-when the app exits or a panic unwinds.
+when the app exits or a panic unwinds. At startup it removes only its own stale
+cache directories from earlier crashes, leaving other applications' files alone.
 
 RAW files are not decoded yet. Convert them to TIFF, JPEG or PNG before
 opening them in the app.
