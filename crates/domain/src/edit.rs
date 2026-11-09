@@ -255,6 +255,97 @@ impl ToneCurve {
     }
 }
 
+/// Pixel counts per 8-bit level for each channel.
+///
+/// Counts are floating point because an adjusted histogram spreads one source
+/// level across the output levels it covers. This removes the comb pattern that
+/// 8-bit lookup-table quantisation would otherwise leave in the display.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Histogram {
+    pub red: [f32; 256],
+    pub green: [f32; 256],
+    pub blue: [f32; 256],
+}
+
+impl Default for Histogram {
+    fn default() -> Self {
+        Self {
+            red: [0.0; 256],
+            green: [0.0; 256],
+            blue: [0.0; 256],
+        }
+    }
+}
+
+impl Histogram {
+    /// Counts the levels in an image that already has its final tones.
+    pub fn from_image(image: &RgbaImage) -> Self {
+        let mut histogram = Self::default();
+        let stride = sample_stride(image);
+        for (index, pixel) in image.pixels().as_chunks::<4>().0.iter().enumerate() {
+            if index % stride != 0 {
+                continue;
+            }
+            histogram.red[pixel[0] as usize] += 1.0;
+            histogram.green[pixel[1] as usize] += 1.0;
+            histogram.blue[pixel[2] as usize] += 1.0;
+        }
+        histogram
+    }
+
+    pub fn peak(&self) -> f32 {
+        self.red
+            .iter()
+            .chain(self.green.iter())
+            .chain(self.blue.iter())
+            .copied()
+            .fold(0.0f32, f32::max)
+            .max(1.0)
+    }
+
+    fn channel_mut(&mut self, channel: usize) -> &mut [f32; 256] {
+        match channel {
+            0 => &mut self.red,
+            1 => &mut self.green,
+            _ => &mut self.blue,
+        }
+    }
+}
+
+/// Caps the work a histogram does on large scans.
+fn sample_stride(image: &RgbaImage) -> usize {
+    (image.total_pixels() / 200_000).max(1)
+}
+
+/// Rec. 709 luma weights for gamma-encoded channels.
+const LUMA_WEIGHTS: [f32; 3] = [0.2126, 0.7152, 0.0722];
+
+/// Spreads one source level's count uniformly over the output levels it covers.
+fn spread_interval(histogram: &mut [f32; 256], low: f32, high: f32, weight: f32) {
+    let low = low.clamp(0.0, 1.0) * 255.0;
+    let high = high.clamp(0.0, 1.0) * 255.0;
+    let (low, high) = if low <= high {
+        (low, high)
+    } else {
+        (high, low)
+    };
+    let width = high - low;
+    if width <= 1e-6 {
+        histogram[(low.round() as usize).min(255)] += weight;
+        return;
+    }
+    let first = low.floor() as usize;
+    let last = (high.floor() as usize).min(255);
+    for (bin, slot) in histogram.iter_mut().enumerate().take(last + 1).skip(first) {
+        let start = low.max(bin as f32);
+        let end = high.min(bin as f32 + 1.0);
+        let overlap = (end - start).max(0.0);
+        if overlap > 0.0 {
+            *slot += weight * overlap / width;
+        }
+    }
+}
+
 /// Integer crop rectangle in source-image coordinates.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CropRect {
@@ -427,6 +518,79 @@ impl EditSettings {
         }
         RgbaImage::new(image.width(), image.height(), pixels).expect("developed image keeps size")
     }
+
+    /// Counts the tones an image will have after these settings are applied.
+    ///
+    /// A direct count of the developed 8-bit pixels shows empty output levels
+    /// whenever exposure or contrast stretches the range, because each 8-bit
+    /// input level lands on a single 8-bit output level. Here every source
+    /// level is treated as covering the continuous range between its two
+    /// quantisation boundaries, so its count spreads over all output levels
+    /// that range touches.
+    pub fn histogram(&self, image: &RgbaImage) -> Histogram {
+        if self.tone_is_identity() {
+            return Histogram::from_image(image);
+        }
+        let settings = self.clone().sanitized();
+        let stride = sample_stride(image);
+        if settings.monochrome {
+            settings.monochrome_histogram(image, stride)
+        } else {
+            settings.color_histogram(image, stride)
+        }
+    }
+
+    fn color_histogram(&self, image: &RgbaImage, stride: usize) -> Histogram {
+        let mut source = [[0.0f32; 256]; 3];
+        for (index, pixel) in image.pixels().as_chunks::<4>().0.iter().enumerate() {
+            if index % stride != 0 {
+                continue;
+            }
+            for (channel, counts) in source.iter_mut().enumerate() {
+                counts[pixel[channel] as usize] += 1.0;
+            }
+        }
+        let mut histogram = Histogram::default();
+        for (channel, counts) in source.iter().enumerate() {
+            let intervals = channel_intervals(self, channel);
+            let target = histogram.channel_mut(channel);
+            for (value, count) in counts.iter().copied().enumerate() {
+                if count > 0.0 {
+                    let (low, high) = intervals[value];
+                    spread_interval(target, low, high, count);
+                }
+            }
+        }
+        histogram
+    }
+
+    fn monochrome_histogram(&self, image: &RgbaImage, stride: usize) -> Histogram {
+        let intervals = [
+            channel_intervals(self, 0),
+            channel_intervals(self, 1),
+            channel_intervals(self, 2),
+        ];
+        let tangents = self.curves.gray.tangents();
+        let mut histogram = Histogram::default();
+        for (index, pixel) in image.pixels().as_chunks::<4>().0.iter().enumerate() {
+            if index % stride != 0 {
+                continue;
+            }
+            let mut low = 0.0;
+            let mut high = 0.0;
+            for (channel, weight) in LUMA_WEIGHTS.iter().copied().enumerate() {
+                let (channel_low, channel_high) = intervals[channel][pixel[channel] as usize];
+                low += weight * channel_low;
+                high += weight * channel_high;
+            }
+            let low = gray_transform(&self.levels.gray, &self.curves.gray, low, &tangents);
+            let high = gray_transform(&self.levels.gray, &self.curves.gray, high, &tangents);
+            spread_interval(&mut histogram.red, low, high, 1.0);
+        }
+        histogram.green = histogram.red;
+        histogram.blue = histogram.red;
+        histogram
+    }
 }
 
 fn apply_luts(row: &mut [u8], luts: &[[u8; 256]; 3], gray_lut: Option<&[u8; 256]>) {
@@ -495,11 +659,44 @@ pub fn suggest_film_base(image: &RgbaImage) -> [u8; 3] {
 }
 
 fn channel_lut(settings: &EditSettings, channel: usize) -> [u8; 256] {
-    let base = settings.film_base.map(|base| base[channel] as f32 / 255.0);
-    let exposure = 2f32.powf(settings.exposure);
-    // Three stops of slope keeps every slider step visually even, including
-    // at the ends of the range.
-    let contrast = 2f32.powf(3.0 * settings.contrast);
+    let (_, curve) = channel_parts(settings, channel);
+    let tangents = curve.tangents();
+    let rgb_tangents = settings.curves.rgb.tangents();
+    let mut lut = [0u8; 256];
+    for (value, slot) in lut.iter_mut().enumerate() {
+        let normalized = channel_transform(
+            settings,
+            channel,
+            value as f32 / 255.0,
+            &tangents,
+            &rgb_tangents,
+        );
+        *slot = (normalized.clamp(0.0, 1.0) * 255.0).round() as u8;
+    }
+    lut
+}
+
+/// The continuous output range that each source level covers after adjustment.
+fn channel_intervals(settings: &EditSettings, channel: usize) -> [(f32, f32); 256] {
+    let (_, curve) = channel_parts(settings, channel);
+    let tangents = curve.tangents();
+    let rgb_tangents = settings.curves.rgb.tangents();
+    let mut intervals = [(0.0, 0.0); 256];
+    for (value, slot) in intervals.iter_mut().enumerate() {
+        let low = ((value as f32 - 0.5) / 255.0).clamp(0.0, 1.0);
+        let high = ((value as f32 + 0.5) / 255.0).clamp(0.0, 1.0);
+        let first = channel_transform(settings, channel, low, &tangents, &rgb_tangents);
+        let second = channel_transform(settings, channel, high, &tangents, &rgb_tangents);
+        *slot = if first <= second {
+            (first, second)
+        } else {
+            (second, first)
+        };
+    }
+    intervals
+}
+
+fn channel_parts(settings: &EditSettings, channel: usize) -> (ChannelLevels, &ToneCurve) {
     let levels = match channel {
         0 => settings.levels.red,
         1 => settings.levels.green,
@@ -510,33 +707,44 @@ fn channel_lut(settings: &EditSettings, channel: usize) -> [u8; 256] {
         1 => &settings.curves.green,
         _ => &settings.curves.blue,
     };
-    let tangents = curve.tangents();
-    let rgb_tangents = settings.curves.rgb.tangents();
-    let mut lut = [0u8; 256];
-    for (value, slot) in lut.iter_mut().enumerate() {
-        let mut normalized = value as f32 / 255.0;
-        if settings.invert {
-            if let Some(base) = base {
-                normalized = ((normalized - base) / (1.0 - base).max(1e-4)).clamp(0.0, 1.0);
-            }
-            normalized = 1.0 - normalized;
+    (levels, curve)
+}
+
+fn channel_transform(
+    settings: &EditSettings,
+    channel: usize,
+    mut normalized: f32,
+    curve_tangents: &[f32],
+    rgb_tangents: &[f32],
+) -> f32 {
+    if settings.invert {
+        if let Some(base) = settings.film_base {
+            let base = base[channel] as f32 / 255.0;
+            normalized = ((normalized - base) / (1.0 - base).max(1e-4)).clamp(0.0, 1.0);
         }
-        normalized = (normalized - 0.5) * contrast + 0.5;
-        normalized *= exposure;
-        normalized = levels.apply(normalized);
-        normalized = curve.evaluate_with(normalized, &tangents);
-        normalized = settings.curves.rgb.evaluate_with(normalized, &rgb_tangents);
-        *slot = (normalized.clamp(0.0, 1.0) * 255.0).round() as u8;
+        normalized = 1.0 - normalized;
     }
-    lut
+    // Three stops of slope keeps every slider step visually even, including
+    // at the ends of the range.
+    let contrast = 2f32.powf(3.0 * settings.contrast);
+    normalized = (normalized - 0.5) * contrast + 0.5;
+    normalized *= 2f32.powf(settings.exposure);
+    let (levels, curve) = channel_parts(settings, channel);
+    normalized = levels.apply(normalized);
+    normalized = curve.evaluate_with(normalized, curve_tangents);
+    settings.curves.rgb.evaluate_with(normalized, rgb_tangents)
+}
+
+fn gray_transform(levels: &ChannelLevels, curve: &ToneCurve, value: f32, tangents: &[f32]) -> f32 {
+    curve.evaluate_with(levels.apply(value), tangents)
 }
 
 fn gray_lut(levels: &ChannelLevels, curve: &ToneCurve) -> [u8; 256] {
     let tangents = curve.tangents();
     let mut lut = [0u8; 256];
     for (value, slot) in lut.iter_mut().enumerate() {
-        let normalized = levels.apply(value as f32 / 255.0);
-        *slot = (curve.evaluate_with(normalized, &tangents).clamp(0.0, 1.0) * 255.0).round() as u8;
+        let normalized = gray_transform(levels, curve, value as f32 / 255.0, &tangents);
+        *slot = (normalized.clamp(0.0, 1.0) * 255.0).round() as u8;
     }
     lut
 }
@@ -897,5 +1105,56 @@ mod tests {
         };
         let pixel = settings.develop(&image).pixel(0, 0);
         assert!(pixel[0] > 200);
+    }
+
+    #[test]
+    fn identity_histogram_counts_the_image_levels() {
+        let image = RgbaImage::filled(10, 10, [12, 34, 56, 255]);
+        let histogram = EditSettings::default().histogram(&image);
+        assert_eq!(histogram.red[12], 100.0);
+        assert_eq!(histogram.green[34], 100.0);
+        assert_eq!(histogram.blue[56], 100.0);
+    }
+
+    #[test]
+    fn adjusted_histogram_has_no_empty_output_levels() {
+        let image = RgbaImage::from_fn(256, 1, |x, _| [x as u8, x as u8, x as u8, 255]);
+        let settings = EditSettings {
+            exposure: 0.4,
+            contrast: 0.3,
+            ..EditSettings::default()
+        };
+        let histogram = settings.histogram(&image);
+        assert!(
+            histogram.red.iter().all(|count| *count > 0.0),
+            "adjusted histogram still has empty bins"
+        );
+    }
+
+    #[test]
+    fn adjusted_histogram_preserves_the_sample_count() {
+        let image = RgbaImage::from_fn(256, 1, |x, _| [x as u8, x as u8, x as u8, 255]);
+        let settings = EditSettings {
+            exposure: -0.7,
+            contrast: -0.4,
+            ..EditSettings::default()
+        };
+        let histogram = settings.histogram(&image);
+        let total: f32 = histogram.red.iter().sum();
+        assert!((total - 256.0).abs() < 0.01, "count was {total}");
+    }
+
+    #[test]
+    fn monochrome_histogram_has_equal_channels() {
+        let image = RgbaImage::from_fn(256, 1, |x, _| [x as u8, 255 - x as u8, x as u8 / 2, 255]);
+        let settings = EditSettings {
+            monochrome: true,
+            exposure: 0.5,
+            contrast: 0.2,
+            ..EditSettings::default()
+        };
+        let histogram = settings.histogram(&image);
+        assert_eq!(histogram.red, histogram.green);
+        assert_eq!(histogram.green, histogram.blue);
     }
 }

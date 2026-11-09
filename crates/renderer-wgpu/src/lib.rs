@@ -151,7 +151,7 @@ impl PreviewRenderer {
             uniform_buffer,
             texture: None,
             max_texture_dimension: limits.max_texture_dimension_2d.max(1),
-            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            format: preview_texture_format(target_format),
         }
     }
 
@@ -302,6 +302,20 @@ impl PreviewRenderer {
     }
 }
 
+/// Returns the upload format that keeps the stored sRGB bytes unchanged.
+///
+/// egui targets are usually non-sRGB (`Rgba8Unorm` or `Bgra8Unorm`). Uploading
+/// sRGB-encoded pixels to an `*Srgb` texture would decode them to linear values,
+/// and the non-sRGB target writes those values without re-encoding. Shadows then
+/// look much darker and contrast too high.
+fn preview_texture_format(target_format: wgpu::TextureFormat) -> wgpu::TextureFormat {
+    if target_format.is_srgb() {
+        wgpu::TextureFormat::Rgba8UnormSrgb
+    } else {
+        wgpu::TextureFormat::Rgba8Unorm
+    }
+}
+
 /// Converts a rect in logical points into normalized device coordinates.
 ///
 /// `rect` is `[min_x, min_y, max_x, max_y]`, `screen` is `[width, height]` in
@@ -337,5 +351,21 @@ mod tests {
         assert!((ndc[1] - 0.5).abs() < 1e-6);
         assert!((ndc[2] - 0.5).abs() < 1e-6);
         assert!((ndc[3] + 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn non_srgb_target_keeps_encoded_pixels() {
+        assert_eq!(
+            preview_texture_format(wgpu::TextureFormat::Bgra8Unorm),
+            wgpu::TextureFormat::Rgba8Unorm
+        );
+    }
+
+    #[test]
+    fn srgb_target_decodes_and_reencodes_pixels() {
+        assert_eq!(
+            preview_texture_format(wgpu::TextureFormat::Bgra8UnormSrgb),
+            wgpu::TextureFormat::Rgba8UnormSrgb
+        );
     }
 }

@@ -11,9 +11,9 @@ use std::sync::Arc;
 
 use stitch_application::{ProjectService, StitchService};
 use stitch_domain::{
-    suggest_film_base, CoreError, CoreResult, CropRect, EditSettings, Homography, ImageId,
-    ImageLocator, PhotoMetadata, Project, RgbaImage, SourceImage, StitchOptions, StitchProgress,
-    StitchResult, StitchStage, MAX_IMAGES,
+    suggest_film_base, CoreError, CoreResult, CropRect, EditSettings, Histogram, Homography,
+    ImageId, ImageLocator, PhotoMetadata, Project, RgbaImage, SourceImage, StitchOptions,
+    StitchProgress, StitchResult, StitchStage, MAX_IMAGES,
 };
 
 /// Longest side used for an edited preview.
@@ -143,6 +143,7 @@ pub struct Workbench {
     preview_cache: RefCell<Option<PreviewCache>>,
     preview_base_cache: RefCell<Option<PreviewBaseCache>>,
     crop_preview_cache: RefCell<Option<CropPreviewCache>>,
+    histogram_cache: RefCell<Option<(u64, PreviewTarget, Histogram)>>,
 }
 
 impl Default for Workbench {
@@ -170,6 +171,7 @@ impl Workbench {
             preview_cache: RefCell::new(None),
             preview_base_cache: RefCell::new(None),
             crop_preview_cache: RefCell::new(None),
+            histogram_cache: RefCell::new(None),
         }
     }
 
@@ -710,6 +712,27 @@ impl Workbench {
             target: self.preview_target,
         });
         fitted
+    }
+
+    /// Tone counts for the current preview, computed from the source before
+    /// quantisation so exposure and contrast do not leave gaps in the curve.
+    pub fn histogram(&self) -> Option<Histogram> {
+        if let Some((revision, target, histogram)) = self.histogram_cache.borrow().as_ref() {
+            if *revision == self.revision && *target == self.preview_target {
+                return Some(histogram.clone());
+            }
+        }
+        let (base, _) = self.base_image()?;
+        let settings = self.current_edits();
+        let histogram = if self.show_edits && !settings.is_identity() {
+            let source = self.preview_base(&base, &settings);
+            settings.histogram(&source)
+        } else {
+            Histogram::from_image(&base)
+        };
+        *self.histogram_cache.borrow_mut() =
+            Some((self.revision, self.preview_target, histogram.clone()));
+        Some(histogram)
     }
 
     /// Creates a snapshot for a background worker and marks the workbench busy.
@@ -1257,6 +1280,42 @@ mod tests {
             .unwrap();
         let saved = repo.saved.lock().unwrap();
         assert_eq!(saved[0].1.pixel(0, 0)[0], 255);
+    }
+
+    #[test]
+    fn adjusted_histogram_has_no_quantisation_gaps() {
+        let repo = Arc::new(MemoryRepo::default());
+        let name = "ramp.png".to_owned();
+        repo.images.lock().unwrap().insert(
+            name.clone(),
+            LoadedImage {
+                locator: ImageLocator::new(name.clone()),
+                name,
+                image: RgbaImage::from_fn(256, 1, |x, _| [x as u8, x as u8, x as u8, 255]),
+                thumbnail: RgbaImage::filled(20, 1, [0, 0, 0, 255]),
+                metadata: PhotoMetadata::default(),
+            },
+        );
+        let mut workbench = Workbench::new();
+        let service = ProjectService::new(repo);
+        workbench
+            .add_images(&service, &[ImageLocator::new("ramp.png")])
+            .unwrap();
+        let id = workbench.selected().unwrap();
+        workbench.update_edits(
+            id,
+            EditSettings {
+                exposure: 0.4,
+                contrast: 0.3,
+                ..EditSettings::default()
+            },
+        );
+
+        let histogram = workbench.histogram().unwrap();
+        assert!(
+            histogram.red.iter().all(|count| *count > 0.0),
+            "histogram still has empty bins"
+        );
     }
 
     #[test]

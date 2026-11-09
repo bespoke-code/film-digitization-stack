@@ -18,12 +18,12 @@ use dialog::{
 use eframe::egui;
 use stitch_application::{ProjectService, StitchService};
 use stitch_domain::{
-    normalized_rotation, rotation_is_identity, CoreResult, CurvePoint, EditSettings, Homography,
-    ImageId, ImageLocator, RgbaImage, SourceImage, StitchOptions, StitchProgress, StitchResult,
-    ToneCurve,
+    normalized_rotation, rotation_is_identity, CoreResult, CurvePoint, EditSettings, Histogram,
+    Homography, ImageId, ImageLocator, RgbaImage, SourceImage, StitchOptions, StitchProgress,
+    StitchResult, ToneCurve,
 };
 use stitch_renderer_wgpu::PreviewRenderer;
-use stitch_ui_core::{PreviewInfo, PreviewTarget, Workbench, WorkbenchStatus};
+use stitch_ui_core::{PreviewTarget, Workbench, WorkbenchStatus};
 
 enum WorkerEvent {
     Progress(StitchProgress),
@@ -33,66 +33,6 @@ enum WorkerEvent {
 struct StitchWorker {
     receiver: Receiver<WorkerEvent>,
     handle: Option<JoinHandle<()>>,
-}
-
-struct Histogram {
-    red: [u32; 256],
-    green: [u32; 256],
-    blue: [u32; 256],
-}
-
-impl Default for Histogram {
-    fn default() -> Self {
-        Self {
-            red: [0; 256],
-            green: [0; 256],
-            blue: [0; 256],
-        }
-    }
-}
-
-impl Histogram {
-    fn from_image(image: &RgbaImage) -> Self {
-        let mut histogram = Self::default();
-        let pixels = image.total_pixels();
-        let stride = (pixels / 200_000).max(1);
-        for (index, pixel) in image.pixels().as_chunks::<4>().0.iter().enumerate() {
-            if index % stride != 0 {
-                continue;
-            }
-            histogram.red[pixel[0] as usize] += 1;
-            histogram.green[pixel[1] as usize] += 1;
-            histogram.blue[pixel[2] as usize] += 1;
-        }
-        histogram
-    }
-
-    fn peak(&self) -> u32 {
-        self.red
-            .iter()
-            .chain(self.green.iter())
-            .chain(self.blue.iter())
-            .copied()
-            .max()
-            .unwrap_or(1)
-            .max(1)
-    }
-}
-
-#[derive(Default)]
-struct HistogramCache {
-    key: Option<(u64, String)>,
-    histogram: Histogram,
-}
-
-impl HistogramCache {
-    fn update(&mut self, preview: &PreviewInfo) {
-        let key = (preview.revision, preview.label.clone());
-        if self.key.as_ref() != Some(&key) {
-            self.histogram = Histogram::from_image(&preview.image);
-            self.key = Some(key);
-        }
-    }
 }
 
 struct PreviewState {
@@ -350,7 +290,6 @@ pub struct ScanToImgApp {
     thumbnails: HashMap<ImageId, egui::TextureHandle>,
     options: StitchOptions,
     preview: PreviewState,
-    histogram: HistogramCache,
     gpu_available: bool,
     pending_paths: Vec<PathBuf>,
     picking_film_base: bool,
@@ -390,7 +329,6 @@ impl ScanToImgApp {
             thumbnails: HashMap::new(),
             options,
             preview: PreviewState::default(),
-            histogram: HistogramCache::default(),
             gpu_available,
             pending_paths,
             picking_film_base: false,
@@ -1640,15 +1578,9 @@ impl eframe::App for ScanToImgApp {
                         ui.separator();
                         self.metadata(ui);
                         ui.separator();
-                        let histogram_preview = if self.crop_mode {
-                            self.workbench.crop_preview().map(|preview| preview.info())
-                        } else {
-                            self.workbench.preview()
-                        };
-                        if let Some(preview) = histogram_preview {
-                            self.histogram.update(&preview);
+                        if let Some(histogram) = self.workbench.histogram() {
                             ui.heading("Histogram");
-                            draw_histogram(ui, &self.histogram.histogram);
+                            draw_histogram(ui, &histogram);
                         }
                         ui.separator();
                         egui::CollapsingHeader::new("Stitch settings")
@@ -2302,11 +2234,11 @@ fn draw_histogram(ui: &mut egui::Ui, histogram: &Histogram) {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 110.0), egui::Sense::hover());
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 3.0, egui::Color32::from_gray(18));
-    let peak = histogram.peak() as f32;
-    let to_screen = |bin: usize, value: u32| {
+    let peak = histogram.peak();
+    let to_screen = |bin: usize, value: f32| {
         egui::pos2(
             rect.left() + rect.width() * bin as f32 / 255.0,
-            rect.bottom() - rect.height() * (value as f32 / peak).sqrt(),
+            rect.bottom() - rect.height() * (value / peak).sqrt(),
         )
     };
     let channels = [
