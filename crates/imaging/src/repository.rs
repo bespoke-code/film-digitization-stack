@@ -3,11 +3,14 @@
 use std::io::{Cursor, Write};
 use std::path::{Path, PathBuf};
 
-use image::{DynamicImage, ImageFormat, RgbaImage as ImageRgbaImage};
+use image::codecs::jpeg::JpegEncoder;
+use image::{DynamicImage, ExtendedColorType, ImageFormat, RgbaImage as ImageRgbaImage};
 use stitch_domain::{
     CoreError, CoreResult, ImageLocator, ImageRepository, LoadedImage, PhotoMetadata, RgbaImage,
+    SaveOptions,
 };
 
+use crate::jpeg::jpeg_quality;
 use crate::metadata::{embed_metadata, extract_metadata};
 
 /// Filesystem-backed [`ImageRepository`].
@@ -66,6 +69,7 @@ impl ImageRepository for FileImageRepository {
             message: error.to_string(),
         })?;
         let metadata = extract_metadata(&bytes);
+        let jpeg_quality = jpeg_quality(&bytes);
         let mut rgba = decoded.to_rgba8();
         if let Some(max_dimension) = self.max_dimension {
             let (width, height) = rgba.dimensions();
@@ -91,11 +95,21 @@ impl ImageRepository for FileImageRepository {
             image,
             thumbnail,
             metadata,
+            jpeg_quality,
         })
     }
 
     fn save(&self, locator: &ImageLocator, image: &RgbaImage) -> CoreResult<()> {
-        let (bytes, _) = self.encode(locator, image)?;
+        self.save_with_options(locator, image, &SaveOptions::default())
+    }
+
+    fn save_with_options(
+        &self,
+        locator: &ImageLocator,
+        image: &RgbaImage,
+        options: &SaveOptions,
+    ) -> CoreResult<()> {
+        let (bytes, _) = self.encode(locator, image, options)?;
         self.write(locator, &bytes)
     }
 
@@ -105,10 +119,20 @@ impl ImageRepository for FileImageRepository {
         image: &RgbaImage,
         metadata: Option<&PhotoMetadata>,
     ) -> CoreResult<()> {
+        self.save_with_metadata_and_options(locator, image, metadata, &SaveOptions::default())
+    }
+
+    fn save_with_metadata_and_options(
+        &self,
+        locator: &ImageLocator,
+        image: &RgbaImage,
+        metadata: Option<&PhotoMetadata>,
+        options: &SaveOptions,
+    ) -> CoreResult<()> {
         let Some(metadata) = metadata.filter(|metadata| !metadata.is_empty()) else {
-            return self.save(locator, image);
+            return self.save_with_options(locator, image, options);
         };
-        let (bytes, format) = self.encode(locator, image)?;
+        let (bytes, format) = self.encode(locator, image, options)?;
         let bytes = embed_metadata(&bytes, format, metadata).unwrap_or(bytes);
         self.write(locator, &bytes)
     }
@@ -119,6 +143,7 @@ impl FileImageRepository {
         &self,
         locator: &ImageLocator,
         image: &RgbaImage,
+        options: &SaveOptions,
     ) -> CoreResult<(Vec<u8>, ImageFormat)> {
         let format = ImageFormat::from_path(Self::path(locator))
             .map_err(|_| CoreError::UnsupportedFormat(locator.as_str().to_owned()))?;
@@ -138,17 +163,29 @@ impl FileImageRepository {
                     "the output buffer does not match its dimensions".to_owned(),
                 )
             })?;
-        let mut dynamic = DynamicImage::ImageRgba8(rgba);
-        if matches!(format, ImageFormat::Jpeg) {
-            dynamic = DynamicImage::ImageRgb8(dynamic.to_rgb8());
-        }
+        let dynamic = DynamicImage::ImageRgba8(rgba);
         let mut bytes = Vec::new();
-        dynamic
-            .write_to(&mut Cursor::new(&mut bytes), format)
-            .map_err(|error| CoreError::Encode {
-                name: locator.display_name(),
-                message: error.to_string(),
-            })?;
+        if format == ImageFormat::Jpeg {
+            let rgb = dynamic.to_rgb8();
+            JpegEncoder::new_with_quality(&mut bytes, options.jpeg_quality.clamp(1, 100))
+                .encode(
+                    rgb.as_raw(),
+                    rgb.width(),
+                    rgb.height(),
+                    ExtendedColorType::Rgb8,
+                )
+                .map_err(|error| CoreError::Encode {
+                    name: locator.display_name(),
+                    message: error.to_string(),
+                })?;
+        } else {
+            dynamic
+                .write_to(&mut Cursor::new(&mut bytes), format)
+                .map_err(|error| CoreError::Encode {
+                    name: locator.display_name(),
+                    message: error.to_string(),
+                })?;
+        }
         Ok((bytes, format))
     }
 
@@ -260,6 +297,39 @@ mod tests {
         assert_eq!(loaded.image.height(), 16);
         assert_eq!(loaded.image.pixel(3, 2), image.pixel(3, 2));
         assert!(loaded.thumbnail.width() <= 320);
+    }
+
+    #[test]
+    fn load_reports_source_jpeg_quality() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("image.jpg");
+        let rgb = image::RgbImage::from_fn(32, 24, |x, y| {
+            image::Rgb([(x * 5) as u8, (y * 7) as u8, 90])
+        });
+        let mut bytes = Vec::new();
+        JpegEncoder::new_with_quality(&mut bytes, 87)
+            .encode(rgb.as_raw(), 32, 24, ExtendedColorType::Rgb8)
+            .unwrap();
+        std::fs::write(&path, bytes).unwrap();
+
+        let loaded = FileImageRepository::default()
+            .load(&ImageLocator::new(path.to_string_lossy()))
+            .unwrap();
+        assert_eq!(loaded.jpeg_quality, Some(87));
+    }
+
+    #[test]
+    fn save_with_options_uses_the_requested_jpeg_quality() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("image.jpg");
+        let locator = ImageLocator::new(path.to_string_lossy());
+        let image = RgbaImage::filled(32, 24, [10, 20, 30, 255]);
+        FileImageRepository::default()
+            .save_with_options(&locator, &image, &SaveOptions { jpeg_quality: 96 })
+            .unwrap();
+
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(jpeg_quality(&bytes), Some(96));
     }
 
     #[test]

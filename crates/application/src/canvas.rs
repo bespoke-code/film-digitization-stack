@@ -134,6 +134,7 @@ mod tests {
             locator: ImageLocator::new(format!("image-{id}")),
             image: Arc::new(RgbaImage::filled(width, height, [0, 0, 0, 255])),
             thumbnail: Arc::new(RgbaImage::filled(8, 8, [0, 0, 0, 255])),
+            jpeg_quality: None,
         }
     }
 

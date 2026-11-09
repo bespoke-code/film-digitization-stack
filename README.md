@@ -50,7 +50,9 @@ Pass image paths to open them at launch:
 5. Existing EXIF details appear automatically. Add or change camera, lens, film and
    exposure details in the **Metadata** pane. PNG, JPEG and WebP exports embed them
    as EXIF; TIFF and BMP do not.
-6. Export as PNG, JPEG, TIFF, WebP or BMP.
+6. Export as PNG, JPEG, TIFF, WebP or BMP. JPEG quality defaults to the source
+   JPEG quality (the lowest source in a panorama) and can be changed in the
+   export dialog.
 
 Source files are never modified.
 

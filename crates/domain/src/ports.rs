@@ -17,6 +17,26 @@ pub struct LoadedImage {
     pub image: RgbaImage,
     pub thumbnail: RgbaImage,
     pub metadata: PhotoMetadata,
+    /// Encoder quality of the source when it is a JPEG.
+    pub jpeg_quality: Option<u8>,
+}
+
+/// Quality used when a source does not provide a better setting.
+pub const DEFAULT_JPEG_QUALITY: u8 = 90;
+
+/// Encoder settings for an export.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SaveOptions {
+    /// JPEG quality in `1..=100`. Ignored by other formats.
+    pub jpeg_quality: u8,
+}
+
+impl Default for SaveOptions {
+    fn default() -> Self {
+        Self {
+            jpeg_quality: DEFAULT_JPEG_QUALITY,
+        }
+    }
 }
 
 /// Durable storage for source images and exported results.
@@ -27,6 +47,17 @@ pub trait ImageRepository: Send + Sync {
     fn load(&self, locator: &ImageLocator) -> CoreResult<LoadedImage>;
     fn save(&self, locator: &ImageLocator, image: &RgbaImage) -> CoreResult<()>;
 
+    /// Saves an image using the given encoder settings.
+    fn save_with_options(
+        &self,
+        locator: &ImageLocator,
+        image: &RgbaImage,
+        options: &SaveOptions,
+    ) -> CoreResult<()> {
+        let _ = options;
+        self.save(locator, image)
+    }
+
     /// Saves an image and embeds descriptive metadata when the format supports it.
     fn save_with_metadata(
         &self,
@@ -36,6 +67,18 @@ pub trait ImageRepository: Send + Sync {
     ) -> CoreResult<()> {
         let _ = metadata;
         self.save(locator, image)
+    }
+
+    /// Saves an image with metadata and explicit encoder settings.
+    fn save_with_metadata_and_options(
+        &self,
+        locator: &ImageLocator,
+        image: &RgbaImage,
+        metadata: Option<&PhotoMetadata>,
+        options: &SaveOptions,
+    ) -> CoreResult<()> {
+        let _ = options;
+        self.save_with_metadata(locator, image, metadata)
     }
 }
 

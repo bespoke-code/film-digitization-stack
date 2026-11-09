@@ -12,8 +12,8 @@ use std::sync::Arc;
 use stitch_application::{ProjectService, StitchService};
 use stitch_domain::{
     suggest_film_base, CoreError, CoreResult, CropRect, EditSettings, Histogram, Homography,
-    ImageId, ImageLocator, PhotoMetadata, Project, RgbaImage, SourceImage, StitchOptions,
-    StitchProgress, StitchResult, StitchStage, MAX_IMAGES,
+    ImageId, ImageLocator, PhotoMetadata, Project, RgbaImage, SaveOptions, SourceImage,
+    StitchOptions, StitchProgress, StitchResult, StitchStage, DEFAULT_JPEG_QUALITY, MAX_IMAGES,
 };
 
 /// Longest side used for an edited preview.
@@ -850,10 +850,56 @@ impl Workbench {
         }
     }
 
+    /// Quality of the source JPEG for the current preview.
+    ///
+    /// A panorama uses the lowest source quality because every stitched frame
+    /// is limited by its weakest input.
+    pub fn source_jpeg_quality(&self) -> Option<u8> {
+        match self.preview_target {
+            PreviewTarget::Stitched => self.lowest_source_jpeg_quality(self.project.images()),
+            PreviewTarget::Image(id) => self.project.get(id).and_then(|image| image.jpeg_quality),
+        }
+    }
+
+    /// JPEG quality offered first when exporting the current preview.
+    pub fn default_export_jpeg_quality(&self) -> u8 {
+        self.source_jpeg_quality().unwrap_or(DEFAULT_JPEG_QUALITY)
+    }
+
+    /// JPEG quality offered first when exporting the whole project.
+    pub fn default_batch_jpeg_quality(&self) -> u8 {
+        self.lowest_source_jpeg_quality(self.project.images())
+            .unwrap_or(DEFAULT_JPEG_QUALITY)
+    }
+
+    fn lowest_source_jpeg_quality(&self, images: &[SourceImage]) -> Option<u8> {
+        images.iter().filter_map(|image| image.jpeg_quality).min()
+    }
+
     pub fn export(&self, service: &ProjectService, locator: &ImageLocator) -> CoreResult<()> {
+        self.export_with_options(
+            service,
+            locator,
+            &SaveOptions {
+                jpeg_quality: self.default_export_jpeg_quality(),
+            },
+        )
+    }
+
+    pub fn export_with_options(
+        &self,
+        service: &ProjectService,
+        locator: &ImageLocator,
+        options: &SaveOptions,
+    ) -> CoreResult<()> {
         let (base, _) = self.base_image().ok_or(CoreError::NoStitchResult)?;
         let image = self.current_edits().develop(&base);
-        service.export_with_metadata(locator, &image, Some(&self.current_metadata()))
+        service.export_with_metadata_and_options(
+            locator,
+            &image,
+            Some(&self.current_metadata()),
+            options,
+        )
     }
 
     /// Writes every loaded image and, when present, the panorama to a folder.
@@ -863,6 +909,23 @@ impl Workbench {
         folder: &Path,
         extension: &str,
     ) -> CoreResult<usize> {
+        self.export_all_with_options(
+            service,
+            folder,
+            extension,
+            &SaveOptions {
+                jpeg_quality: self.default_batch_jpeg_quality(),
+            },
+        )
+    }
+
+    pub fn export_all_with_options(
+        &self,
+        service: &ProjectService,
+        folder: &Path,
+        extension: &str,
+        options: &SaveOptions,
+    ) -> CoreResult<usize> {
         if self.project.is_empty() {
             return Err(CoreError::EmptyProject);
         }
@@ -871,10 +934,11 @@ impl Workbench {
             let stem = export_stem(&image.locator, image.id.0);
             let path = folder.join(format!("{stem}-edited.{extension}"));
             let developed = self.edits(image.id).develop(&image.image);
-            service.export_with_metadata(
+            service.export_with_metadata_and_options(
                 &ImageLocator::from(path.as_path()),
                 &developed,
                 Some(&self.image_metadata(image.id)),
+                options,
             )?;
             written += 1;
         }
@@ -887,10 +951,11 @@ impl Workbench {
                 .unwrap_or_else(|| "panorama".to_owned());
             let path = folder.join(format!("{stem}-stitched.{extension}"));
             let developed = self.result_edits.develop(&result.image);
-            service.export_with_metadata(
+            service.export_with_metadata_and_options(
                 &ImageLocator::from(path.as_path()),
                 &developed,
                 Some(&self.result_metadata),
+                options,
             )?;
             written += 1;
         }
@@ -992,6 +1057,7 @@ mod tests {
                 image: patterned_image(400, 200),
                 thumbnail: RgbaImage::filled(20, 10, [0, 0, 0, 255]),
                 metadata: PhotoMetadata::default(),
+                jpeg_quality: None,
             },
         );
         let mut workbench = Workbench::new();
@@ -1033,6 +1099,7 @@ mod tests {
                 image: patterned_image(3840, 2560),
                 thumbnail: RgbaImage::filled(20, 15, [0, 0, 0, 255]),
                 metadata: PhotoMetadata::default(),
+                jpeg_quality: None,
             },
         );
         let mut workbench = Workbench::new();
@@ -1093,6 +1160,7 @@ mod tests {
                 image: patterned_image(6000, 4000),
                 thumbnail: RgbaImage::filled(20, 15, [0, 0, 0, 255]),
                 metadata: PhotoMetadata::default(),
+                jpeg_quality: None,
             },
         );
         let mut workbench = Workbench::new();
@@ -1131,6 +1199,7 @@ mod tests {
         images: Mutex<HashMap<String, LoadedImage>>,
         saved: Mutex<Vec<(String, RgbaImage)>>,
         saved_metadata: Mutex<Vec<(String, Option<PhotoMetadata>)>>,
+        saved_options: Mutex<Vec<(String, u8)>>,
     }
 
     impl ImageRepository for MemoryRepo {
@@ -1163,6 +1232,20 @@ mod tests {
                 .push((locator.as_str().to_owned(), metadata.cloned()));
             self.save(locator, image)
         }
+
+        fn save_with_metadata_and_options(
+            &self,
+            locator: &ImageLocator,
+            image: &RgbaImage,
+            metadata: Option<&PhotoMetadata>,
+            options: &SaveOptions,
+        ) -> CoreResult<()> {
+            self.saved_options
+                .lock()
+                .unwrap()
+                .push((locator.as_str().to_owned(), options.jpeg_quality));
+            self.save_with_metadata(locator, image, metadata)
+        }
     }
 
     fn repo_with(count: usize) -> Arc<MemoryRepo> {
@@ -1178,6 +1261,7 @@ mod tests {
                     image: RgbaImage::filled(40, 30, [index as u8, 0, 0, 255]),
                     thumbnail: RgbaImage::filled(20, 15, [0, 0, 0, 255]),
                     metadata: PhotoMetadata::default(),
+                    jpeg_quality: None,
                 },
             );
         }
@@ -1294,6 +1378,7 @@ mod tests {
                 image: RgbaImage::from_fn(256, 1, |x, _| [x as u8, x as u8, x as u8, 255]),
                 thumbnail: RgbaImage::filled(20, 1, [0, 0, 0, 255]),
                 metadata: PhotoMetadata::default(),
+                jpeg_quality: None,
             },
         );
         let mut workbench = Workbench::new();
@@ -1363,6 +1448,81 @@ mod tests {
             assert!(workbench.edits(image.id).invert);
             assert!(workbench.edits(image.id).crop.is_none());
         }
+    }
+
+    fn repo_with_jpeg_qualities(qualities: &[Option<u8>]) -> Arc<MemoryRepo> {
+        let repo = Arc::new(MemoryRepo::default());
+        let mut map = repo.images.lock().unwrap();
+        for (index, quality) in qualities.iter().enumerate() {
+            let name = format!("image-{index}.jpg");
+            map.insert(
+                name.clone(),
+                LoadedImage {
+                    locator: ImageLocator::new(name.clone()),
+                    name,
+                    image: RgbaImage::filled(40, 30, [index as u8, 0, 0, 255]),
+                    thumbnail: RgbaImage::filled(20, 15, [0, 0, 0, 255]),
+                    metadata: PhotoMetadata::default(),
+                    jpeg_quality: *quality,
+                },
+            );
+        }
+        drop(map);
+        repo
+    }
+
+    fn add_jpegs(workbench: &mut Workbench, repo: &Arc<MemoryRepo>, count: usize) {
+        let service = ProjectService::new(repo.clone());
+        let locators: Vec<ImageLocator> = (0..count)
+            .map(|index| ImageLocator::new(format!("image-{index}.jpg")))
+            .collect();
+        workbench.add_images(&service, &locators).unwrap();
+    }
+
+    #[test]
+    fn export_quality_defaults_to_source_jpeg_quality() {
+        let repo = repo_with_jpeg_qualities(&[Some(92), Some(80)]);
+        let mut workbench = Workbench::new();
+        add_jpegs(&mut workbench, &repo, 2);
+        let first = workbench.project().images()[0].id;
+        workbench.select_image(first).unwrap();
+        assert_eq!(workbench.default_export_jpeg_quality(), 92);
+        assert_eq!(workbench.default_batch_jpeg_quality(), 80);
+
+        workbench.finish_stitch(StitchResult {
+            image: Arc::new(RgbaImage::filled(8, 8, [10, 20, 30, 255])),
+            placements: Vec::new(),
+            diagnostics: stitch_domain::StitchDiagnostics::default(),
+        });
+        workbench.show_stitched().unwrap();
+        assert_eq!(workbench.source_jpeg_quality(), Some(80));
+        assert_eq!(workbench.default_export_jpeg_quality(), 80);
+
+        let service = ProjectService::new(repo.clone());
+        workbench
+            .export(&service, &ImageLocator::new("out.jpg"))
+            .unwrap();
+        workbench
+            .export_all(&service, Path::new("/tmp"), "jpg")
+            .unwrap();
+        let options = repo.saved_options.lock().unwrap();
+        assert_eq!(options.len(), 4);
+        assert!(options.iter().all(|(_, quality)| *quality == 80));
+    }
+
+    #[test]
+    fn export_quality_falls_back_when_sources_are_not_jpeg() {
+        let repo = repo_with(2);
+        let mut workbench = Workbench::new();
+        add(&mut workbench, &repo, 2);
+        assert_eq!(
+            workbench.default_export_jpeg_quality(),
+            stitch_domain::DEFAULT_JPEG_QUALITY
+        );
+        assert_eq!(
+            workbench.default_batch_jpeg_quality(),
+            stitch_domain::DEFAULT_JPEG_QUALITY
+        );
     }
 
     #[test]
@@ -1613,6 +1773,7 @@ mod tests {
                 image: RgbaImage::filled(40, 30, [1, 2, 3, 255]),
                 thumbnail: RgbaImage::filled(20, 15, [0, 0, 0, 255]),
                 metadata: metadata.clone(),
+                jpeg_quality: None,
             },
         );
 

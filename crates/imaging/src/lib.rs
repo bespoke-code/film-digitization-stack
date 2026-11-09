@@ -2,6 +2,7 @@
 
 pub mod cache;
 pub mod compositor;
+mod jpeg;
 mod metadata;
 pub mod repository;
 

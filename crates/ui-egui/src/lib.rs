@@ -19,8 +19,8 @@ use eframe::egui;
 use stitch_application::{ProjectService, StitchService};
 use stitch_domain::{
     normalized_rotation, rotation_is_identity, CoreResult, CurvePoint, EditSettings, Histogram,
-    Homography, ImageId, ImageLocator, RgbaImage, SourceImage, StitchOptions, StitchProgress,
-    StitchResult, ToneCurve,
+    Homography, ImageId, ImageLocator, RgbaImage, SaveOptions, SourceImage, StitchOptions,
+    StitchProgress, StitchResult, ToneCurve,
 };
 use stitch_renderer_wgpu::PreviewRenderer;
 use stitch_ui_core::{PreviewTarget, Workbench, WorkbenchStatus};
@@ -510,20 +510,31 @@ impl ScanToImgApp {
                     self.add_paths(images);
                 }
             }
-            DialogOutcome::SaveImage(path) => {
+            DialogOutcome::SaveImage(path, quality) => {
                 let locator = ImageLocator::from(path.as_path());
-                match self.workbench.export(&self.project_service, &locator) {
+                let options = SaveOptions {
+                    jpeg_quality: quality,
+                };
+                match self
+                    .workbench
+                    .export_with_options(&self.project_service, &locator, &options)
+                {
                     Ok(()) => self
                         .workbench
                         .notify(format!("Exported to {}", path.display())),
                     Err(error) => self.workbench.fail_stitch(error.to_string()),
                 }
             }
-            DialogOutcome::SaveFolder(folder, format) => {
-                match self
-                    .workbench
-                    .export_all(&self.project_service, &folder, format.extension())
-                {
+            DialogOutcome::SaveFolder(folder, format, quality) => {
+                let options = SaveOptions {
+                    jpeg_quality: quality,
+                };
+                match self.workbench.export_all_with_options(
+                    &self.project_service,
+                    &folder,
+                    format.extension(),
+                    &options,
+                ) {
                     Ok(count) => self.workbench.notify(format!(
                         "Exported {count} image{} to {}.",
                         if count == 1 { "" } else { "s" },
@@ -563,12 +574,20 @@ impl ScanToImgApp {
                 .add_enabled(self.workbench.can_add(), egui::Button::new(add_label))
                 .clicked()
             {
-                self.dialog
-                    .open_in(DialogMode::AddImages, None, String::new());
+                self.dialog.open_in(
+                    DialogMode::AddImages,
+                    None,
+                    String::new(),
+                    self.workbench.default_export_jpeg_quality(),
+                );
             }
             if ui.button("Open folder").clicked() {
-                self.dialog
-                    .open_in(DialogMode::OpenFolder, None, String::new());
+                self.dialog.open_in(
+                    DialogMode::OpenFolder,
+                    None,
+                    String::new(),
+                    self.workbench.default_export_jpeg_quality(),
+                );
             }
             if ui
                 .add_enabled(
@@ -634,6 +653,7 @@ impl ScanToImgApp {
                     DialogMode::SaveImage,
                     self.default_export_dir(),
                     self.default_export_name(),
+                    self.workbench.default_export_jpeg_quality(),
                 );
             }
             if ui
@@ -647,6 +667,7 @@ impl ScanToImgApp {
                     DialogMode::SaveFolder,
                     self.default_export_dir(),
                     String::new(),
+                    self.workbench.default_batch_jpeg_quality(),
                 );
             }
             if ui.button("Clear").clicked() {

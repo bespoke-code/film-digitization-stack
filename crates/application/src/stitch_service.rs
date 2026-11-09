@@ -486,6 +486,7 @@ fn rotate_images(images: &[SourceImage], rotations: &[f32]) -> Vec<SourceImage> 
                     locator: image.locator.clone(),
                     image: Arc::new(image.image.rotated(degrees)),
                     thumbnail: image.thumbnail.clone(),
+                    jpeg_quality: image.jpeg_quality,
                 }
             }
         })
@@ -628,6 +629,7 @@ mod tests {
             locator: ImageLocator::new(format!("image-{id}")),
             image: Arc::new(RgbaImage::filled(200, 100, [0, 0, 0, 255])),
             thumbnail: Arc::new(RgbaImage::filled(20, 10, [0, 0, 0, 255])),
+            jpeg_quality: None,
         }
     }
 

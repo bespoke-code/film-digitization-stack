@@ -9,6 +9,8 @@ use std::path::{Path, PathBuf};
 
 use egui::{Context, RichText};
 
+use stitch_domain::DEFAULT_JPEG_QUALITY;
+
 pub(crate) const IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "webp", "bmp", "tif", "tiff"];
 
 /// Camera RAW extensions. They are listed here only to explain why they are
@@ -63,8 +65,8 @@ impl SaveFormat {
 pub(crate) enum DialogOutcome {
     AddImages(Vec<PathBuf>),
     OpenFolder(PathBuf),
-    SaveImage(PathBuf),
-    SaveFolder(PathBuf, SaveFormat),
+    SaveImage(PathBuf, u8),
+    SaveFolder(PathBuf, SaveFormat, u8),
 }
 
 struct Entry {
@@ -81,6 +83,7 @@ pub(crate) struct FileDialog {
     selected: BTreeSet<PathBuf>,
     filename: String,
     format: SaveFormat,
+    quality: u8,
     error: Option<String>,
     needs_reload: bool,
 }
@@ -95,6 +98,7 @@ impl Default for FileDialog {
             selected: BTreeSet::new(),
             filename: String::new(),
             format: SaveFormat::Png,
+            quality: DEFAULT_JPEG_QUALITY,
             error: None,
             needs_reload: true,
         }
@@ -102,11 +106,18 @@ impl Default for FileDialog {
 }
 
 impl FileDialog {
-    pub(crate) fn open_in(&mut self, mode: DialogMode, start: Option<PathBuf>, filename: String) {
+    pub(crate) fn open_in(
+        &mut self,
+        mode: DialogMode,
+        start: Option<PathBuf>,
+        filename: String,
+        quality: u8,
+    ) {
         self.mode = mode;
         self.selected.clear();
         self.error = None;
         self.filename = filename;
+        self.quality = quality.clamp(1, 100);
         if let Some(start) = start {
             let start = if start.is_dir() {
                 start
@@ -276,10 +287,13 @@ impl FileDialog {
                             }
                         });
                 });
+                self.jpeg_quality(ui);
                 ui.horizontal(|ui| {
                     if ui.button("Export").clicked() {
                         match self.save_path() {
-                            Ok(path) => *outcome = Some(DialogOutcome::SaveImage(path)),
+                            Ok(path) => {
+                                *outcome = Some(DialogOutcome::SaveImage(path, self.quality))
+                            }
                             Err(error) => self.error = Some(error),
                         }
                     }
@@ -300,16 +314,31 @@ impl FileDialog {
                             }
                         });
                     if ui.button("Export all here").clicked() {
-                        *outcome =
-                            Some(DialogOutcome::SaveFolder(self.current.clone(), self.format));
+                        *outcome = Some(DialogOutcome::SaveFolder(
+                            self.current.clone(),
+                            self.format,
+                            self.quality,
+                        ));
                     }
                     if ui.button("Cancel").clicked() {
                         self.open = false;
                     }
                 });
+                self.jpeg_quality(ui);
                 ui.weak("Each image is written as <name>-edited.<format> next to the originals.");
             }
         }
+    }
+
+    fn jpeg_quality(&mut self, ui: &mut egui::Ui) {
+        if self.format != SaveFormat::Jpeg {
+            return;
+        }
+        ui.horizontal(|ui| {
+            ui.label("JPEG quality");
+            ui.add(egui::Slider::new(&mut self.quality, 1..=100));
+            ui.weak("Defaults to the source JPEG quality.");
+        });
     }
 
     fn save_path(&self) -> Result<PathBuf, String> {

@@ -71,6 +71,8 @@ pub struct SourceImage {
     pub locator: ImageLocator,
     pub image: Arc<RgbaImage>,
     pub thumbnail: Arc<RgbaImage>,
+    /// Encoder quality of the source when it is a JPEG.
+    pub jpeg_quality: Option<u8>,
 }
 
 impl SourceImage {
@@ -141,6 +143,7 @@ impl Project {
             locator: loaded.locator,
             image: Arc::new(loaded.image),
             thumbnail: Arc::new(loaded.thumbnail),
+            jpeg_quality: loaded.jpeg_quality,
         });
         Ok(id)
     }
@@ -205,6 +208,7 @@ mod tests {
             thumbnail: RgbaImage::filled(4, 4, [0, 0, 0, 255]),
             image: RgbaImage::filled(8, 8, [0, 0, 0, 255]),
             metadata: PhotoMetadata::default(),
+            jpeg_quality: None,
         }
     }
 

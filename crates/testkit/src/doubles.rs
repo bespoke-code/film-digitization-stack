@@ -38,6 +38,7 @@ impl InMemoryImageRepository {
                 image,
                 thumbnail,
                 metadata: PhotoMetadata::default(),
+                jpeg_quality: None,
             },
         );
     }
@@ -97,6 +98,7 @@ impl ImageRepository for InMemoryImageRepository {
                 image: image.clone(),
                 thumbnail,
                 metadata: PhotoMetadata::default(),
+                jpeg_quality: None,
             },
         );
         Ok(())
@@ -634,5 +636,6 @@ pub fn source_image(id: u64, width: u32, height: u32) -> SourceImage {
         locator: ImageLocator::new(format!("image-{id}")),
         thumbnail: Arc::new(image.thumbnail(64)),
         image: Arc::new(image),
+        jpeg_quality: None,
     }
 }
