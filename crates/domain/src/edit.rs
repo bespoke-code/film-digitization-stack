@@ -280,15 +280,14 @@ impl Default for Histogram {
 impl Histogram {
     /// Counts the levels in an image that already has its final tones.
     pub fn from_image(image: &RgbaImage) -> Self {
-        let mut histogram = Self::default();
         let stride = sample_stride(image);
-        for (index, pixel) in image.pixels().as_chunks::<4>().0.iter().enumerate() {
-            if index % stride != 0 {
-                continue;
+        let counts = sample_counts(image.pixels().as_chunks::<4>().0, stride);
+        let mut histogram = Self::default();
+        for (channel, source) in counts.iter().enumerate() {
+            let target = histogram.channel_mut(channel);
+            for (level, count) in source.iter().enumerate() {
+                target[level] = *count as f32;
             }
-            histogram.red[pixel[0] as usize] += 1.0;
-            histogram.green[pixel[1] as usize] += 1.0;
-            histogram.blue[pixel[2] as usize] += 1.0;
         }
         histogram
     }
@@ -315,6 +314,53 @@ impl Histogram {
 /// Caps the work a histogram does on large scans.
 fn sample_stride(image: &RgbaImage) -> usize {
     (image.total_pixels() / 200_000).max(1)
+}
+
+/// Chunk size that keeps every chunk boundary on a sampling boundary.
+///
+/// Parallel chunks must start at a multiple of `stride`, otherwise each chunk
+/// restarts the sampling phase and the sample set differs from a single scan.
+fn sample_chunk_size(stride: usize) -> usize {
+    const TARGET: usize = 1 << 17;
+    (TARGET / stride).max(1) * stride
+}
+
+/// Counts the sampled source levels in parallel.
+///
+/// The per-chunk counts are merged in chunk order so the result is identical
+/// to a single-threaded scan.
+fn sample_counts(pixels: &[[u8; 4]], stride: usize) -> [[u32; 256]; 3] {
+    if pixels.len() < PARALLEL_PIXEL_THRESHOLD {
+        let mut counts = [[0u32; 256]; 3];
+        count_chunk(pixels, stride, &mut counts);
+        return counts;
+    }
+    let chunk_size = sample_chunk_size(stride);
+    let partials: Vec<[[u32; 256]; 3]> = pixels
+        .par_chunks(chunk_size)
+        .map(|chunk| {
+            let mut local = [[0u32; 256]; 3];
+            count_chunk(chunk, stride, &mut local);
+            local
+        })
+        .collect();
+    let mut counts = [[0u32; 256]; 3];
+    for partial in partials {
+        for (channel, source) in partial.iter().enumerate() {
+            for (level, count) in source.iter().enumerate() {
+                counts[channel][level] += count;
+            }
+        }
+    }
+    counts
+}
+
+fn count_chunk(pixels: &[[u8; 4]], stride: usize, counts: &mut [[u32; 256]; 3]) {
+    for pixel in pixels.iter().step_by(stride) {
+        counts[0][pixel[0] as usize] += 1;
+        counts[1][pixel[1] as usize] += 1;
+        counts[2][pixel[2] as usize] += 1;
+    }
 }
 
 /// Rec. 709 luma weights for gamma-encoded channels.
@@ -541,23 +587,15 @@ impl EditSettings {
     }
 
     fn color_histogram(&self, image: &RgbaImage, stride: usize) -> Histogram {
-        let mut source = [[0.0f32; 256]; 3];
-        for (index, pixel) in image.pixels().as_chunks::<4>().0.iter().enumerate() {
-            if index % stride != 0 {
-                continue;
-            }
-            for (channel, counts) in source.iter_mut().enumerate() {
-                counts[pixel[channel] as usize] += 1.0;
-            }
-        }
+        let source = sample_counts(image.pixels().as_chunks::<4>().0, stride);
         let mut histogram = Histogram::default();
         for (channel, counts) in source.iter().enumerate() {
             let intervals = channel_intervals(self, channel);
             let target = histogram.channel_mut(channel);
             for (value, count) in counts.iter().copied().enumerate() {
-                if count > 0.0 {
+                if count > 0 {
                     let (low, high) = intervals[value];
-                    spread_interval(target, low, high, count);
+                    spread_interval(target, low, high, count as f32);
                 }
             }
         }
@@ -571,25 +609,46 @@ impl EditSettings {
             channel_intervals(self, 2),
         ];
         let tangents = self.curves.gray.tangents();
-        let mut histogram = Histogram::default();
-        for (index, pixel) in image.pixels().as_chunks::<4>().0.iter().enumerate() {
-            if index % stride != 0 {
-                continue;
+        let pixels = image.pixels().as_chunks::<4>().0;
+        let scan = |chunk: &[[u8; 4]], local: &mut [f32; 256]| {
+            for pixel in chunk.iter().step_by(stride) {
+                let mut low = 0.0;
+                let mut high = 0.0;
+                for (channel, weight) in LUMA_WEIGHTS.iter().copied().enumerate() {
+                    let (channel_low, channel_high) = intervals[channel][pixel[channel] as usize];
+                    low += weight * channel_low;
+                    high += weight * channel_high;
+                }
+                let low = gray_transform(&self.levels.gray, &self.curves.gray, low, &tangents);
+                let high = gray_transform(&self.levels.gray, &self.curves.gray, high, &tangents);
+                spread_interval(local, low, high, 1.0);
             }
-            let mut low = 0.0;
-            let mut high = 0.0;
-            for (channel, weight) in LUMA_WEIGHTS.iter().copied().enumerate() {
-                let (channel_low, channel_high) = intervals[channel][pixel[channel] as usize];
-                low += weight * channel_low;
-                high += weight * channel_high;
+        };
+
+        let mut red = [0.0f32; 256];
+        if pixels.len() < PARALLEL_PIXEL_THRESHOLD {
+            scan(pixels, &mut red);
+        } else {
+            let chunk_size = sample_chunk_size(stride);
+            let partials: Vec<[f32; 256]> = pixels
+                .par_chunks(chunk_size)
+                .map(|chunk| {
+                    let mut local = [0.0f32; 256];
+                    scan(chunk, &mut local);
+                    local
+                })
+                .collect();
+            for partial in partials {
+                for (total, value) in red.iter_mut().zip(partial) {
+                    *total += value;
+                }
             }
-            let low = gray_transform(&self.levels.gray, &self.curves.gray, low, &tangents);
-            let high = gray_transform(&self.levels.gray, &self.curves.gray, high, &tangents);
-            spread_interval(&mut histogram.red, low, high, 1.0);
         }
-        histogram.green = histogram.red;
-        histogram.blue = histogram.red;
-        histogram
+        Histogram {
+            red,
+            green: red,
+            blue: red,
+        }
     }
 }
 
@@ -1156,5 +1215,126 @@ mod tests {
         let histogram = settings.histogram(&image);
         assert_eq!(histogram.red, histogram.green);
         assert_eq!(histogram.green, histogram.blue);
+    }
+
+    /// The single-threaded reference used before the histogram was parallelised.
+    fn sequential_histogram(settings: &EditSettings, image: &RgbaImage) -> Histogram {
+        let stride = sample_stride(image);
+        if settings.tone_is_identity() {
+            let mut histogram = Histogram::default();
+            for pixel in image.pixels().as_chunks::<4>().0.iter().step_by(stride) {
+                histogram.red[pixel[0] as usize] += 1.0;
+                histogram.green[pixel[1] as usize] += 1.0;
+                histogram.blue[pixel[2] as usize] += 1.0;
+            }
+            return histogram;
+        }
+        let settings = settings.clone().sanitized();
+        if settings.monochrome {
+            let intervals = [
+                channel_intervals(&settings, 0),
+                channel_intervals(&settings, 1),
+                channel_intervals(&settings, 2),
+            ];
+            let tangents = settings.curves.gray.tangents();
+            let mut histogram = Histogram::default();
+            for pixel in image.pixels().as_chunks::<4>().0.iter().step_by(stride) {
+                let mut low = 0.0;
+                let mut high = 0.0;
+                for (channel, weight) in LUMA_WEIGHTS.iter().copied().enumerate() {
+                    let (channel_low, channel_high) = intervals[channel][pixel[channel] as usize];
+                    low += weight * channel_low;
+                    high += weight * channel_high;
+                }
+                let low =
+                    gray_transform(&settings.levels.gray, &settings.curves.gray, low, &tangents);
+                let high = gray_transform(
+                    &settings.levels.gray,
+                    &settings.curves.gray,
+                    high,
+                    &tangents,
+                );
+                spread_interval(&mut histogram.red, low, high, 1.0);
+            }
+            histogram.green = histogram.red;
+            histogram.blue = histogram.red;
+            histogram
+        } else {
+            let mut source = [[0.0f32; 256]; 3];
+            for pixel in image.pixels().as_chunks::<4>().0.iter().step_by(stride) {
+                for (channel, counts) in source.iter_mut().enumerate() {
+                    counts[pixel[channel] as usize] += 1.0;
+                }
+            }
+            let mut histogram = Histogram::default();
+            for (channel, counts) in source.iter().enumerate() {
+                let intervals = channel_intervals(&settings, channel);
+                let target = histogram.channel_mut(channel);
+                for (value, count) in counts.iter().copied().enumerate() {
+                    if count > 0.0 {
+                        let (low, high) = intervals[value];
+                        spread_interval(target, low, high, count);
+                    }
+                }
+            }
+            histogram
+        }
+    }
+
+    fn assert_histograms_close(expected: &Histogram, actual: &Histogram, label: &str) {
+        let mut expected_total = 0.0;
+        let mut actual_total = 0.0;
+        for (expected, actual) in [
+            (&expected.red, &actual.red),
+            (&expected.green, &actual.green),
+            (&expected.blue, &actual.blue),
+        ] {
+            for (expected, actual) in expected.iter().zip(actual) {
+                expected_total += expected;
+                actual_total += actual;
+                // Chunk-local sums change the floating-point addition order.
+                let tolerance = expected.abs().max(1.0) * 1e-4;
+                assert!(
+                    (expected - actual).abs() <= tolerance,
+                    "{label} histogram bin differs: {expected} vs {actual}"
+                );
+            }
+        }
+        // A different sample set would shift the total by a whole pixel or more.
+        let total_tolerance = expected_total * 1e-5 + 1.0;
+        assert!(
+            (expected_total - actual_total).abs() <= total_tolerance,
+            "{label} histogram sampled a different number of pixels: {expected_total} vs {actual_total}"
+        );
+    }
+
+    #[test]
+    fn parallel_histograms_match_a_single_scan() {
+        let image = patterned_image(1024, 768);
+        let stride = sample_stride(&image);
+        assert!(stride > 1, "the test image must exercise sampling");
+
+        let pixels = image.pixels().as_chunks::<4>().0;
+        let mut expected = [[0u32; 256]; 3];
+        for (index, pixel) in pixels.iter().enumerate() {
+            if index % stride != 0 {
+                continue;
+            }
+            expected[0][pixel[0] as usize] += 1;
+            expected[1][pixel[1] as usize] += 1;
+            expected[2][pixel[2] as usize] += 1;
+        }
+        assert_eq!(sample_counts(pixels, stride), expected);
+
+        for monochrome in [false, true] {
+            let settings = EditSettings {
+                monochrome,
+                ..representative_settings(0.3, 0.35)
+            };
+            let parallel = settings.histogram(&image);
+            let sequential = sequential_histogram(&settings, &image);
+            let label = if monochrome { "monochrome" } else { "color" };
+            assert_histograms_close(&sequential, &parallel, label);
+        }
     }
 }
