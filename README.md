@@ -16,26 +16,50 @@ Stitched by the app:
 
 ## Install and run
 
+### Packages
+
+`just release` builds the uploadable artifacts for the host in `dist/` and
+writes `SHA256SUMS`. Run it on each system and architecture that you publish.
+Ubuntu needs `dpkg-deb`; Omarchy/Arch needs `makepkg` from `base-devel`.
+
+| System | Artifact | Install |
+| --- | --- | --- |
+| Ubuntu/Debian | `scan-to-img_<version>_<arch>.deb` | `sudo apt install ./dist/...deb` |
+| Omarchy/Arch | `scan-to-img-<version>-1-<arch>.pkg.tar.zst` | `sudo pacman -U dist/...pkg.tar.zst` |
+| macOS | `scan-to-img-<version>-macos-<arch>.dmg` | Open, then drag to Applications |
+
+The same run also writes portable `tar.gz` archives and a macOS `zip`. The
+macOS app is ad-hoc signed by default. If Gatekeeper blocks the first launch,
+right-click the app and choose Open. Set `CODESIGN_IDENTITY` to sign with a
+Developer ID.
+
+### From source
+
 Rust 1.95 or newer is required. Linux needs the usual X11/Wayland development
 packages and a working Vulkan or OpenGL driver. macOS uses Metal.
 
 ```sh
 git clone <repository-url>
 cd scan-to-img
-cargo build --release
-./target/release/scan-to-img
+just install
 ```
 
-With [`just`](https://github.com/casey/just) installed:
+`just install` puts the binary in `~/.local/bin` and adds a desktop entry on
+Linux. On macOS it installs `Scan to image.app` in `~/Applications` and links
+the binary into `~/.local/bin`. Pass a prefix to override the binary location:
+`just install /usr/local`.
+
+Without [`just`](https://github.com/casey/just):
 
 ```sh
-just run
+cargo build --release
+./target/release/scan-to-img
 ```
 
 Pass image paths to open them at launch:
 
 ```sh
-./target/release/scan-to-img scans/*.jpg
+scan-to-img scans/*.jpg
 ```
 
 ## Use
@@ -67,9 +91,11 @@ opening them in the app.
 ## Development
 
 ```sh
-just check   # formatting, clippy, tests and real-time preview budgets
-just perf    # performance tests only
-just build   # release binary
+just check    # formatting, clippy, tests and real-time preview budgets
+just perf     # performance tests only
+just package  # installers and archives in dist/
+just release  # formatting, clippy, tests and package
+just build    # release binary
 ```
 
 The workspace keeps the domain and UI-independent state free of GUI, GPU,

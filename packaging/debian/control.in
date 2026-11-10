@@ -1,0 +1,12 @@
+Package: scan-to-img
+Version: @VERSION@
+Section: graphics
+Priority: optional
+Architecture: @ARCH@
+Maintainer: Andrej Georgievski <6819247+bespoke-code@users.noreply.github.com>
+Depends: libc6, libx11-6, libxcursor1, libxrandr2, libxi6, libxinerama1, libxkbcommon0, libxkbcommon-x11-0, libwayland-client0, libwayland-cursor0, libwayland-egl1, libegl1, libgl1, libvulkan1, libfontconfig1
+Recommends: mesa-vulkan-drivers, libgl1-mesa-dri
+Description: Stitch and invert film scans
+ Scan to image turns overlapping digital-camera scans of film negatives
+ into one clean positive image. It stitches up to 16 frames, supports
+ cropping and tone adjustments, and exports PNG, JPEG, TIFF, WebP or BMP.

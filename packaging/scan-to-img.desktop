@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Scan to image
+GenericName=Film Scan Stitcher
+Comment=Stitch and invert film scans
+Exec=@EXEC@ %F
+Icon=scan-to-img
+Terminal=false
+Categories=Graphics;Photography;
+MimeType=image/jpeg;image/png;image/tiff;image/webp;image/bmp;
+Keywords=film;negative;scan;stitch;invert;
+StartupNotify=true

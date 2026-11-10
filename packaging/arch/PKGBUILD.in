@@ -1,0 +1,18 @@
+pkgname=scan-to-img
+pkgver=@VERSION@
+pkgrel=1
+pkgdesc="Stitch and invert film scans"
+arch=('@ARCH@')
+url="https://github.com/bespoke-code/film-digitization-stack"
+license=('custom:Source-available')
+depends=('glibc' 'libx11' 'libxcursor' 'libxrandr' 'libxi' 'libxinerama' 'libxkbcommon' 'libxkbcommon-x11' 'wayland' 'libglvnd' 'vulkan-icd-loader' 'fontconfig')
+optdepends=('mesa: open-source Vulkan and OpenGL drivers' 'nvidia-utils: NVIDIA Vulkan driver')
+source=('scan-to-img' 'scan-to-img.desktop' 'scan-to-img.svg' 'LICENSE.md')
+sha256sums=('SKIP' 'SKIP' 'SKIP' 'SKIP')
+
+package() {
+    install -Dm755 "$srcdir/scan-to-img" "$pkgdir/usr/bin/scan-to-img"
+    install -Dm644 "$srcdir/scan-to-img.desktop" "$pkgdir/usr/share/applications/scan-to-img.desktop"
+    install -Dm644 "$srcdir/scan-to-img.svg" "$pkgdir/usr/share/icons/hicolor/scalable/apps/scan-to-img.svg"
+    install -Dm644 "$srcdir/LICENSE.md" "$pkgdir/usr/share/licenses/scan-to-img/LICENSE.md"
+}
