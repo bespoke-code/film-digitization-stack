@@ -20,6 +20,7 @@ pub mod image;
 pub mod metadata;
 pub mod ports;
 pub mod project;
+pub mod quality;
 pub mod stitch;
 
 pub use edit::{
@@ -37,6 +38,7 @@ pub use ports::{
     SharedEstimator, SharedExtractor, SharedMatcher, SharedRepository, DEFAULT_JPEG_QUALITY,
 };
 pub use project::{ImageId, ImageLocator, Project, SourceImage, MAX_IMAGES};
+pub use quality::{laplacian_variance, FocusMap};
 pub use stitch::{
     HomographyEstimate, ImagePlacement, PairDiagnostics, StitchDiagnostics, StitchOptions,
     StitchProgress, StitchResult, StitchStage, WarpLayer, WarpOptions,

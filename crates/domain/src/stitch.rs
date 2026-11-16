@@ -42,7 +42,7 @@ impl Default for StitchOptions {
             min_inliers: 12,
             ransac_iterations: 2500,
             max_canvas_dimension: 12_000,
-            max_canvas_pixels: 36_000_000,
+            max_canvas_pixels: 110_000_000,
             feather_fraction: 0.08,
             normalize_colors: true,
         }
@@ -59,7 +59,7 @@ impl StitchOptions {
         self.min_inliers = self.min_inliers.clamp(6, 500);
         self.ransac_iterations = self.ransac_iterations.clamp(100, 20_000);
         self.max_canvas_dimension = self.max_canvas_dimension.clamp(512, 16_384);
-        self.max_canvas_pixels = self.max_canvas_pixels.clamp(1_000_000, 64_000_000);
+        self.max_canvas_pixels = self.max_canvas_pixels.clamp(1_000_000, 150_000_000);
         self.feather_fraction = self.feather_fraction.clamp(0.0, 0.5);
         self
     }

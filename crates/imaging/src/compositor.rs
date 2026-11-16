@@ -1,17 +1,28 @@
-//! CPU compositor with inverse warping, bilinear sampling and feather blending.
+//! CPU compositor with inverse warping, bilinear sampling and focus-aware
+//! feather blending.
 
 use std::sync::Arc;
 
 use rayon::prelude::*;
 use stitch_domain::{
-    Compositor, CoreError, CoreResult, Homography, Point, RgbaImage, WarpLayer, WarpOptions,
+    Compositor, CoreError, CoreResult, FocusMap, Homography, Point, RgbaImage, WarpLayer,
+    WarpOptions,
 };
+
+/// Rows accumulated at once. Bounded band memory lets the compositor work at
+/// full scan resolution without allocating a canvas-sized float accumulator.
+const BAND_ROWS: usize = 128;
+const ANALYSIS_LIMIT: u32 = 1024;
+const FOCUS_TILE_COLUMNS: usize = 8;
+const FOCUS_TILE_ROWS: usize = 8;
+const MIN_FOCUS_WEIGHT: f64 = 0.15;
 
 /// Warps all layers into one RGBA canvas.
 ///
-/// Each layer is sampled through the inverse homography. Overlapping pixels are
-/// averaged with a smooth edge weight, which hides seams without requiring a
-/// multi-band pyramid. Accumulation is row-parallel with rayon.
+/// Each layer is sampled through the inverse homography. Overlapping pixels
+/// are averaged with a smooth edge weight and a local focus weight, so a soft
+/// frame cannot smear detail over a sharp one. Rows are processed in bands,
+/// keeping memory independent of the canvas area.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct BilinearCompositor;
 
@@ -30,6 +41,8 @@ struct PreparedLayer {
     max_x: i64,
     max_y: i64,
     feather: f64,
+    focus: FocusMap,
+    focus_weight: f64,
 }
 
 impl Compositor for BilinearCompositor {
@@ -37,130 +50,170 @@ impl Compositor for BilinearCompositor {
         if layers.is_empty() {
             return Err(CoreError::EmptyProject);
         }
-        let width = options.canvas_width.max(1);
-        let height = options.canvas_height.max(1);
-        let pixels = width as usize * height as usize;
-        if pixels == 0 {
+        let width = options.canvas_width.max(1) as usize;
+        let height = options.canvas_height.max(1) as usize;
+        if width == 0 || height == 0 {
             return Err(CoreError::Compositing(
                 "the output canvas is empty".to_owned(),
             ));
         }
 
-        let mut prepared = Vec::with_capacity(layers.len());
-        for layer in layers {
-            let inverse = layer.homography.inverse().ok_or_else(|| {
-                CoreError::Compositing(format!("'{}' has a singular transform", layer.name))
-            })?;
-            let quad = layer
-                .homography
-                .transform_quad(layer.image.width(), layer.image.height())
-                .ok_or_else(|| {
-                    CoreError::Compositing(format!("'{}' maps to infinity", layer.name))
-                })?;
-            let min_x = quad
-                .iter()
-                .map(|p| p.x)
-                .fold(f64::INFINITY, f64::min)
-                .floor()
-                .max(0.0) as i64;
-            let min_y = quad
-                .iter()
-                .map(|p| p.y)
-                .fold(f64::INFINITY, f64::min)
-                .floor()
-                .max(0.0) as i64;
-            let max_x = quad
-                .iter()
-                .map(|p| p.x)
-                .fold(f64::NEG_INFINITY, f64::max)
-                .ceil()
-                .min(width as f64 - 1.0) as i64;
-            let max_y = quad
-                .iter()
-                .map(|p| p.y)
-                .fold(f64::NEG_INFINITY, f64::max)
-                .ceil()
-                .min(height as f64 - 1.0) as i64;
-
-            let feather = (options.feather_fraction.max(0.0) as f64)
-                * layer.image.width().min(layer.image.height()) as f64;
-            prepared.push(PreparedLayer {
-                image: layer.image.clone(),
-                inverse,
-                gain: layer.gain,
-                min_x,
-                min_y,
-                max_x,
-                max_y,
-                feather,
-            });
+        let mut prepared = prepare_layers(layers, options)?;
+        let reference_focus = prepared
+            .iter()
+            .map(|layer| layer.focus.median())
+            .fold(0.0f64, f64::max);
+        for layer in &mut prepared {
+            if reference_focus > 0.0 && layer.focus.median() > 0.0 {
+                layer.focus_weight =
+                    (layer.focus.median() / reference_focus).clamp(MIN_FOCUS_WEIGHT, 1.0);
+            }
         }
 
-        let mut accum_rgb = vec![0.0f32; pixels * 3];
-        let mut accum_weight = vec![0.0f32; pixels];
+        let mut output = vec![0u8; width * height * 4];
+        for band_start in (0..height).step_by(BAND_ROWS) {
+            let band_end = (band_start + BAND_ROWS).min(height);
+            let band_height = band_end - band_start;
+            let mut accum_rgb = vec![0.0f32; band_height * width * 3];
+            let mut accum_weight = vec![0.0f32; band_height * width];
 
-        accum_rgb
-            .par_chunks_mut(width as usize * 3)
-            .zip(accum_weight.par_chunks_mut(width as usize))
-            .enumerate()
-            .for_each(|(y, (rgb_row, weight_row))| {
-                for layer in &prepared {
-                    if (y as i64) < layer.min_y || (y as i64) > layer.max_y {
-                        continue;
-                    }
-                    for x in layer.min_x..=layer.max_x {
-                        let Some((sample_x, sample_y)) =
-                            inverse_point(&layer.inverse, x as f64, y as f64)
-                        else {
-                            continue;
-                        };
-                        let Some(color) = layer.image.sample_bilinear(sample_x, sample_y) else {
-                            continue;
-                        };
-                        let alpha = color[3] as f32 / 255.0;
-                        if alpha <= 0.0 {
+            accum_rgb
+                .par_chunks_mut(width * 3)
+                .zip(accum_weight.par_chunks_mut(width))
+                .enumerate()
+                .for_each(|(local_y, (rgb_row, weight_row))| {
+                    let y = band_start + local_y;
+                    for layer in &prepared {
+                        if (y as i64) < layer.min_y || (y as i64) > layer.max_y {
                             continue;
                         }
-                        let distance = sample_x
-                            .min(sample_y)
-                            .min(layer.image.width() as f64 - 1.0 - sample_x)
-                            .min(layer.image.height() as f64 - 1.0 - sample_y);
-                        let weight = feather_weight(distance, layer.feather) * alpha;
-                        if weight <= 0.0 {
+                        for x in layer.min_x..=layer.max_x {
+                            let Some((sample_x, sample_y)) =
+                                inverse_point(&layer.inverse, x as f64, y as f64)
+                            else {
+                                continue;
+                            };
+                            let Some(color) = layer.image.sample_bilinear(sample_x, sample_y)
+                            else {
+                                continue;
+                            };
+                            let alpha = color[3] as f32 / 255.0;
+                            if alpha <= 0.0 {
+                                continue;
+                            }
+                            let distance = sample_x
+                                .min(sample_y)
+                                .min(layer.image.width() as f64 - 1.0 - sample_x)
+                                .min(layer.image.height() as f64 - 1.0 - sample_y);
+                            let local_focus = layer.focus.at(
+                                sample_x,
+                                sample_y,
+                                layer.image.width(),
+                                layer.image.height(),
+                            );
+                            let sharpness = if reference_focus <= 0.0 || local_focus <= 0.0 {
+                                layer.focus_weight
+                            } else {
+                                (local_focus / reference_focus)
+                                    .clamp(MIN_FOCUS_WEIGHT, 1.0)
+                                    .min(layer.focus_weight)
+                            };
+                            let weight = (feather_weight(distance, layer.feather) as f64
+                                * sharpness
+                                * alpha as f64) as f32;
+                            if weight <= 0.0 {
+                                continue;
+                            }
+                            let base = x as usize * 3;
+                            rgb_row[base] += color[0] as f32 * layer.gain[0] * weight;
+                            rgb_row[base + 1] += color[1] as f32 * layer.gain[1] * weight;
+                            rgb_row[base + 2] += color[2] as f32 * layer.gain[2] * weight;
+                            weight_row[x as usize] += weight;
+                        }
+                    }
+                });
+
+            let band_output = &mut output[band_start * width * 4..band_end * width * 4];
+            band_output
+                .par_chunks_mut(width * 4)
+                .zip(accum_rgb.par_chunks(width * 3))
+                .zip(accum_weight.par_chunks(width))
+                .for_each(|((out_row, rgb_row), weight_row)| {
+                    for (x, weight) in weight_row.iter().copied().enumerate() {
+                        if weight <= 1e-8 {
                             continue;
                         }
-                        let base = x as usize * 3;
-                        rgb_row[base] += color[0] as f32 * layer.gain[0] * weight;
-                        rgb_row[base + 1] += color[1] as f32 * layer.gain[1] * weight;
-                        rgb_row[base + 2] += color[2] as f32 * layer.gain[2] * weight;
-                        weight_row[x as usize] += weight;
+                        let base_in = x * 3;
+                        let base_out = x * 4;
+                        out_row[base_out] =
+                            (rgb_row[base_in] / weight).round().clamp(0.0, 255.0) as u8;
+                        out_row[base_out + 1] =
+                            (rgb_row[base_in + 1] / weight).round().clamp(0.0, 255.0) as u8;
+                        out_row[base_out + 2] =
+                            (rgb_row[base_in + 2] / weight).round().clamp(0.0, 255.0) as u8;
+                        out_row[base_out + 3] = 255;
                     }
-                }
-            });
+                });
+        }
 
-        let mut output = vec![0u8; pixels * 4];
-        output
-            .par_chunks_mut(width as usize * 4)
-            .zip(accum_rgb.par_chunks(width as usize * 3))
-            .zip(accum_weight.par_chunks(width as usize))
-            .for_each(|((out_row, rgb_row), weight_row)| {
-                for (x, weight) in weight_row.iter().copied().enumerate() {
-                    if weight <= 1e-8 {
-                        continue;
-                    }
-                    let base_in = x * 3;
-                    let base_out = x * 4;
-                    out_row[base_out] = (rgb_row[base_in] / weight).round().clamp(0.0, 255.0) as u8;
-                    out_row[base_out + 1] =
-                        (rgb_row[base_in + 1] / weight).round().clamp(0.0, 255.0) as u8;
-                    out_row[base_out + 2] =
-                        (rgb_row[base_in + 2] / weight).round().clamp(0.0, 255.0) as u8;
-                    out_row[base_out + 3] = 255;
-                }
-            });
-
-        RgbaImage::new(width, height, output)
+        RgbaImage::new(width as u32, height as u32, output)
     }
+}
+
+fn prepare_layers(layers: &[WarpLayer], options: &WarpOptions) -> CoreResult<Vec<PreparedLayer>> {
+    let mut prepared = Vec::with_capacity(layers.len());
+    for layer in layers {
+        let inverse = layer.homography.inverse().ok_or_else(|| {
+            CoreError::Compositing(format!("'{}' has a singular transform", layer.name))
+        })?;
+        let quad = layer
+            .homography
+            .transform_quad(layer.image.width(), layer.image.height())
+            .ok_or_else(|| CoreError::Compositing(format!("'{}' maps to infinity", layer.name)))?;
+        let min_x = quad
+            .iter()
+            .map(|p| p.x)
+            .fold(f64::INFINITY, f64::min)
+            .floor()
+            .max(0.0) as i64;
+        let min_y = quad
+            .iter()
+            .map(|p| p.y)
+            .fold(f64::INFINITY, f64::min)
+            .floor()
+            .max(0.0) as i64;
+        let max_x = quad
+            .iter()
+            .map(|p| p.x)
+            .fold(f64::NEG_INFINITY, f64::max)
+            .ceil()
+            .min(options.canvas_width as f64 - 1.0) as i64;
+        let max_y = quad
+            .iter()
+            .map(|p| p.y)
+            .fold(f64::NEG_INFINITY, f64::max)
+            .ceil()
+            .min(options.canvas_height as f64 - 1.0) as i64;
+
+        let preview = layer.image.resized_to_fit(ANALYSIS_LIMIT);
+        let gray = preview.to_gray();
+        let focus = FocusMap::new(&gray, FOCUS_TILE_COLUMNS, FOCUS_TILE_ROWS);
+        let feather = (options.feather_fraction.max(0.0) as f64)
+            * layer.image.width().min(layer.image.height()) as f64;
+        prepared.push(PreparedLayer {
+            image: layer.image.clone(),
+            inverse,
+            gain: layer.gain,
+            min_x,
+            min_y,
+            max_x,
+            max_y,
+            feather,
+            focus,
+            focus_weight: 1.0,
+        });
+    }
+    Ok(prepared)
 }
 
 fn inverse_point(inverse: &Homography, x: f64, y: f64) -> Option<(f64, f64)> {
@@ -284,5 +337,77 @@ mod tests {
             .composite(&[warp], &options(4, 4))
             .unwrap();
         assert_eq!(output.pixel(0, 0), [200, 25, 25, 255]);
+    }
+
+    #[test]
+    fn soft_layer_does_not_average_away_sharp_detail() {
+        use stitch_domain::laplacian_variance;
+
+        let sharp = RgbaImage::from_fn(128, 128, |x, y| {
+            let value = if (x / 4 + y / 4).is_multiple_of(2) {
+                255
+            } else {
+                0
+            };
+            [value, value, value, 255]
+        });
+        let sharp_gray = sharp.to_gray();
+        let blurred = RgbaImage::from_fn(128, 128, |x, y| {
+            let mut sum = 0.0;
+            let mut count = 0;
+            for dy in -4i64..=4 {
+                for dx in -4i64..=4 {
+                    if let Some(value) = sharp_gray.at_signed(x as i64 + dx, y as i64 + dy) {
+                        sum += value;
+                        count += 1;
+                    }
+                }
+            }
+            let value = (sum / count as f32 * 255.0).round().clamp(0.0, 255.0) as u8;
+            [value, value, value, 255]
+        });
+        assert!(
+            laplacian_variance(&sharp_gray) > laplacian_variance(&blurred.to_gray()) * 4.0,
+            "the synthetic soft layer must be measurably softer"
+        );
+
+        let layers = vec![
+            layer(sharp.clone(), Homography::identity()),
+            layer(blurred.clone(), Homography::translation(8.0, 0.0)),
+        ];
+        let output = BilinearCompositor
+            .composite(
+                &layers,
+                &WarpOptions {
+                    canvas_width: 136,
+                    canvas_height: 128,
+                    feather_fraction: 0.0,
+                },
+            )
+            .unwrap();
+
+        let (x, y) = (64, 64);
+        let actual = output.pixel(x, y)[0] as f64;
+        let sharp_value = sharp.pixel(x, y)[0] as f64;
+        let soft_value = blurred.sample_bilinear(x as f64 - 8.0, y as f64).unwrap()[0] as f64;
+        assert!(
+            (actual - sharp_value).abs() < (actual - soft_value).abs() * 0.5,
+            "output {actual:.1} should follow sharp {sharp_value:.1}, not soft {soft_value:.1}"
+        );
+    }
+
+    #[test]
+    fn bands_cover_the_whole_canvas() {
+        let image = RgbaImage::from_fn(20, 300, |x, y| [x as u8, y as u8, 40, 255]);
+        let output = BilinearCompositor
+            .composite(
+                &[layer(image.clone(), Homography::identity())],
+                &options(20, 300),
+            )
+            .unwrap();
+        assert_eq!(output.height(), 300);
+        for y in (0..300).step_by(37) {
+            assert_eq!(output.pixel(3, y), image.pixel(3, y), "row {y}");
+        }
     }
 }

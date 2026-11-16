@@ -22,19 +22,23 @@ impl Default for RansacHomographyEstimator {
     }
 }
 
+/// Offsets added to the configured seed. RANSAC is deterministic per seed, so
+/// a failed attempt is retried with a different sample order instead of giving
+/// up on a pair that another draw would register.
+const RETRY_OFFSETS: [u64; 3] = [0, 0x2545_F491_4F6C_DD1D, 0x9E37_79B9_7F4A_7C15];
+
 impl RansacHomographyEstimator {
     pub fn with_seed(seed: u64) -> Self {
         Self { seed }
     }
-}
 
-impl HomographyEstimator for RansacHomographyEstimator {
-    fn estimate(
+    fn estimate_once(
         &self,
         query: &FeatureSet,
         train: &FeatureSet,
         matches: &[FeatureMatch],
         options: &StitchOptions,
+        seed: u64,
     ) -> CoreResult<HomographyEstimate> {
         let mut source = Vec::with_capacity(matches.len());
         let mut destination = Vec::with_capacity(matches.len());
@@ -69,7 +73,7 @@ impl HomographyEstimator for RansacHomographyEstimator {
         let sample_count = source.len();
         let iterations = options.ransac_iterations.max(100);
 
-        let mut rng = SplitMix64::new(self.seed);
+        let mut rng = SplitMix64::new(seed);
         let mut best_inliers: Vec<usize> = Vec::new();
         let mut best_homography: Option<Homography> = None;
         let mut required_iterations = iterations;
@@ -124,7 +128,12 @@ impl HomographyEstimator for RansacHomographyEstimator {
             ));
         }
 
-        // Refine twice on the inlier set and reclassify.
+        // Refine twice on the inlier set. Only keep a refinement when its
+        // accuracy gain outweighs the reprojection error it introduces.
+        let mut best_score = fit_score(
+            best_inliers.len(),
+            compute_rms(&homography, &source, &destination, &best_inliers),
+        );
         for _ in 0..2 {
             let src: Vec<Point> = best_inliers.iter().map(|&i| normalized_source[i]).collect();
             let dst: Vec<Point> = best_inliers
@@ -138,15 +147,17 @@ impl HomographyEstimator for RansacHomographyEstimator {
                 break;
             };
             let inliers = collect_inliers(&refined, &source, &destination, threshold_squared);
-            if inliers.len() < 4 {
+            if inliers.len() < 4 || !is_plausible(&refined, &source, &inliers) {
+                break;
+            }
+            let refined_rms = compute_rms(&refined, &source, &destination, &inliers);
+            let refined_score = fit_score(inliers.len(), refined_rms);
+            if refined_score <= best_score {
                 break;
             }
             homography = refined;
-            if inliers.len() == best_inliers.len() {
-                best_inliers = inliers;
-                break;
-            }
             best_inliers = inliers;
+            best_score = refined_score;
         }
 
         if best_inliers.len() < options.min_inliers {
@@ -161,15 +172,13 @@ impl HomographyEstimator for RansacHomographyEstimator {
                 "estimated homography is not invertible".to_owned(),
             ));
         }
-
-        let mut squared_error = 0.0;
-        for &index in &best_inliers {
-            if let Some(projected) = homography.transform(source[index]) {
-                let error = projected.distance(destination[index]);
-                squared_error += error * error;
-            }
+        if !is_plausible(&homography, &source, &best_inliers) {
+            return Err(CoreError::Homography(
+                "estimated homography is geometrically implausible".to_owned(),
+            ));
         }
-        let rms_error = (squared_error / best_inliers.len() as f64).sqrt();
+
+        let rms_error = compute_rms(&homography, &source, &destination, &best_inliers);
         let num_matches = matches.len();
 
         Ok(HomographyEstimate {
@@ -179,6 +188,53 @@ impl HomographyEstimator for RansacHomographyEstimator {
             num_matches,
         })
     }
+}
+
+impl HomographyEstimator for RansacHomographyEstimator {
+    fn estimate(
+        &self,
+        query: &FeatureSet,
+        train: &FeatureSet,
+        matches: &[FeatureMatch],
+        options: &StitchOptions,
+    ) -> CoreResult<HomographyEstimate> {
+        let mut last_error = None;
+        for offset in RETRY_OFFSETS {
+            let seed = self.seed.wrapping_add(offset);
+            match self.estimate_once(query, train, matches, options, seed) {
+                Ok(estimate) => return Ok(estimate),
+                Err(error) => last_error = Some(error),
+            }
+        }
+        Err(last_error
+            .unwrap_or_else(|| CoreError::Homography("no transform could be estimated".to_owned())))
+    }
+}
+
+fn compute_rms(
+    homography: &Homography,
+    source: &[Point],
+    destination: &[Point],
+    inliers: &[usize],
+) -> f64 {
+    let mut squared_error = 0.0;
+    let mut count = 0usize;
+    for &index in inliers {
+        if let Some(projected) = homography.transform(source[index]) {
+            let error = projected.distance(destination[index]);
+            squared_error += error * error;
+            count += 1;
+        }
+    }
+    if count == 0 {
+        return f64::INFINITY;
+    }
+    (squared_error / count as f64).sqrt()
+}
+
+/// More inliers are better, but not at the price of a much worse fit.
+fn fit_score(inliers: usize, rms: f64) -> f64 {
+    inliers as f64 / (1.0 + rms.max(0.0))
 }
 
 fn solve_dlt(source: &[Point], destination: &[Point]) -> Option<Homography> {
@@ -284,6 +340,87 @@ fn collect_inliers(
         }
     }
     inliers
+}
+
+/// Rejects transforms that flip, compress or shear the image far beyond what
+/// overlapping camera scans can produce. The bounds are intentionally generous:
+/// they keep perspective alignment working while filtering false matches that
+/// happen to satisfy the reprojection threshold.
+fn is_plausible(homography: &Homography, source: &[Point], inliers: &[usize]) -> bool {
+    let Some((min_x, max_x, min_y, max_y)) = inlier_bounds(source, inliers) else {
+        return false;
+    };
+    let width = (max_x - min_x).max(1.0);
+    let height = (max_y - min_y).max(1.0);
+    let corners = [
+        Point::new(min_x, min_y),
+        Point::new(max_x, min_y),
+        Point::new(max_x, max_y),
+        Point::new(min_x, max_y),
+    ];
+    let mut mapped = [Point::default(); 4];
+    for (index, corner) in corners.into_iter().enumerate() {
+        let Some(point) = homography.transform(corner) else {
+            return false;
+        };
+        mapped[index] = point;
+    }
+
+    // A non-positive signed area means the quad was mirrored by the
+    // projective term.
+    let area = polygon_area(&mapped);
+    if area < 1.0 {
+        return false;
+    }
+    let mapped_area_ratio = area / (width * height);
+    if !(0.10..=12.0).contains(&mapped_area_ratio) {
+        return false;
+    }
+
+    let edges = [
+        mapped[0].distance(mapped[1]) / width,
+        mapped[2].distance(mapped[3]) / width,
+        mapped[1].distance(mapped[2]) / height,
+        mapped[0].distance(mapped[3]) / height,
+    ];
+    if edges.iter().any(|edge| !(0.20..=5.0).contains(edge)) {
+        return false;
+    }
+    let horizontal_scale = (edges[0] + edges[1]) * 0.5;
+    let vertical_scale = (edges[2] + edges[3]) * 0.5;
+    let anisotropy = (horizontal_scale / vertical_scale.max(1e-9))
+        .max(vertical_scale / horizontal_scale.max(1e-9));
+    if anisotropy > 3.0 {
+        return false;
+    }
+    let opposite_edge_ratio = (edges[0] / edges[1].max(1e-9))
+        .max(edges[1] / edges[0].max(1e-9))
+        .max(edges[2] / edges[3].max(1e-9))
+        .max(edges[3] / edges[2].max(1e-9));
+    opposite_edge_ratio <= 3.5
+}
+
+fn inlier_bounds(source: &[Point], inliers: &[usize]) -> Option<(f64, f64, f64, f64)> {
+    let mut min_x = f64::INFINITY;
+    let mut max_x = f64::NEG_INFINITY;
+    let mut min_y = f64::INFINITY;
+    let mut max_y = f64::NEG_INFINITY;
+    for &index in inliers {
+        let point = source.get(index).copied()?;
+        min_x = min_x.min(point.x);
+        max_x = max_x.max(point.x);
+        min_y = min_y.min(point.y);
+        max_y = max_y.max(point.y);
+    }
+    (min_x.is_finite() && min_y.is_finite() && max_x.is_finite() && max_y.is_finite())
+        .then_some((min_x, max_x, min_y, max_y))
+}
+
+fn polygon_area(points: &[Point; 4]) -> f64 {
+    0.5 * ((points[0].x * points[1].y - points[1].x * points[0].y)
+        + (points[1].x * points[2].y - points[2].x * points[1].y)
+        + (points[2].x * points[3].y - points[3].x * points[2].y)
+        + (points[3].x * points[0].y - points[0].x * points[3].y))
 }
 
 fn is_degenerate(sample: &[usize], points: &[Point]) -> bool {
@@ -473,6 +610,75 @@ mod tests {
         assert!(RansacHomographyEstimator::default()
             .estimate(&query, &train, &matches(60), &options)
             .is_err());
+    }
+
+    #[test]
+    fn retries_all_seeds_recover_a_known_transform() {
+        let transform = Homography::from_rows([
+            [1.05, -0.08, 37.0],
+            [0.06, 1.03, -19.0],
+            [0.0001, -0.00005, 1.0],
+        ]);
+        let source: Vec<Point> = (0..8)
+            .flat_map(|y| {
+                (0..8).map(move |x| Point::new(40.0 + x as f64 * 28.0, 30.0 + y as f64 * 26.0))
+            })
+            .collect();
+        let destination: Vec<Point> = source
+            .iter()
+            .map(|point| transform.transform(*point).unwrap())
+            .collect();
+        let query = feature_set(&source);
+        let train = feature_set(&destination);
+        let all_matches: Vec<FeatureMatch> = (0..source.len())
+            .map(|i| FeatureMatch::new(i, i, 1.0))
+            .collect();
+        let options = StitchOptions {
+            min_inliers: 30,
+            ..StitchOptions::default()
+        };
+        for seed in [1, 2, 3] {
+            let estimate = RansacHomographyEstimator::with_seed(seed)
+                .estimate(&query, &train, &all_matches, &options)
+                .unwrap_or_else(|error| panic!("seed {seed} failed: {error}"));
+            let probe = Point::new(90.0, 70.0);
+            let actual = estimate.homography.transform(probe).unwrap();
+            let expected = transform.transform(probe).unwrap();
+            assert!(
+                actual.distance(expected) < 1.0,
+                "seed {seed}: {actual:?} != {expected:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_a_geometrically_implausible_transform() {
+        // A false match set can be perfectly consistent with a homography that
+        // mirrors or wildly distorts the scan. It must not be accepted just
+        // because RANSAC found many inliers.
+        let mirroring =
+            Homography::from_rows([[0.33, 0.0, 275.0], [0.0, 4.58, 500.0], [0.0, 0.0, 1.0]]);
+        let source: Vec<Point> = (0..8)
+            .flat_map(|y| {
+                (0..8).map(move |x| Point::new(40.0 + x as f64 * 30.0, 30.0 + y as f64 * 28.0))
+            })
+            .collect();
+        let destination: Vec<Point> = source
+            .iter()
+            .map(|point| mirroring.transform(*point).unwrap())
+            .collect();
+        let query = feature_set(&source);
+        let train = feature_set(&destination);
+        let all_matches: Vec<FeatureMatch> = (0..source.len())
+            .map(|i| FeatureMatch::new(i, i, 1.0))
+            .collect();
+        let error = RansacHomographyEstimator::default()
+            .estimate(&query, &train, &all_matches, &StitchOptions::default())
+            .unwrap_err();
+        assert!(
+            matches!(error, CoreError::Homography(_)),
+            "unexpected success: {error}"
+        );
     }
 
     #[test]

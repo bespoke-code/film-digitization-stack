@@ -390,11 +390,43 @@ impl StitchService {
         options: &StitchOptions,
         diagnostics: &mut Vec<PairDiagnostics>,
     ) -> Option<Candidate> {
-        let matches = self.matcher.match_features(
-            &features[query_index],
-            &features[target_index],
-            options.match_ratio,
-        );
+        let query_features = &features[query_index];
+        let target_features = &features[target_index];
+        let mut matches =
+            self.matcher
+                .match_features(query_features, target_features, options.match_ratio);
+        let mut estimate = self.estimate_pair(query_features, target_features, &matches, options);
+
+        // A blurred or low-contrast frame can lose its matches under the strict
+        // ratio. Retry once with a relaxed ratio before declaring no overlap.
+        let weak = estimate
+            .as_ref()
+            .map(|estimate| estimate.inliers.len() < options.min_inliers * 2)
+            .unwrap_or(true);
+        let relaxed_ratio = (options.match_ratio + 0.1).min(0.95);
+        if weak && relaxed_ratio > options.match_ratio {
+            let relaxed =
+                self.matcher
+                    .match_features(query_features, target_features, relaxed_ratio);
+            if relaxed.len() > matches.len() {
+                if let Some(relaxed_estimate) =
+                    self.estimate_pair(query_features, target_features, &relaxed, options)
+                {
+                    let better = estimate
+                        .as_ref()
+                        .map(|current| {
+                            relaxed_estimate.inliers.len() > current.inliers.len()
+                                || (relaxed_estimate.inliers.len() == current.inliers.len()
+                                    && relaxed_estimate.rms_error < current.rms_error)
+                        })
+                        .unwrap_or(true);
+                    if better {
+                        matches = relaxed;
+                        estimate = Some(relaxed_estimate);
+                    }
+                }
+            }
+        }
 
         let from = images[query_index].id;
         let to = images[target_index].id;
@@ -408,21 +440,11 @@ impl StitchService {
             used_for_alignment: false,
         };
 
-        if matches.len() < options.min_inliers {
-            diagnostics.push(diagnostic);
-            return None;
-        }
-
-        let estimate = match self.estimator.estimate(
-            &features[query_index],
-            &features[target_index],
-            &matches,
-            options,
-        ) {
-            Ok(estimate) => estimate,
-            Err(error) => {
+        let estimate = match estimate {
+            Some(estimate) => estimate,
+            None => {
                 log::debug!(
-                    "pair {} -> {} rejected: {error}",
+                    "pair {} -> {} rejected: no valid transform",
                     images[query_index].name,
                     images[target_index].name
                 );
@@ -461,6 +483,21 @@ impl StitchService {
             inliers: estimate.inliers.len(),
             diagnostic_index,
         })
+    }
+
+    fn estimate_pair(
+        &self,
+        query: &FeatureSet,
+        target: &FeatureSet,
+        matches: &[stitch_domain::FeatureMatch],
+        options: &StitchOptions,
+    ) -> Option<HomographyEstimate> {
+        if matches.len() < options.min_inliers {
+            return None;
+        }
+        self.estimator
+            .estimate(query, target, matches, options)
+            .ok()
     }
 }
 
@@ -559,6 +596,27 @@ mod tests {
             train: &FeatureSet,
             _ratio: f32,
         ) -> Vec<FeatureMatch> {
+            let count = query.len().min(train.len());
+            (0..count)
+                .map(|index| FeatureMatch::new(index, index, 0.1))
+                .collect()
+        }
+    }
+
+    /// Returns no matches under the strict ratio and a full set under the
+    /// relaxed retry ratio, which is what a low-contrast scan can look like.
+    struct StrictThenRelaxedMatcher;
+
+    impl FeatureMatcher for StrictThenRelaxedMatcher {
+        fn match_features(
+            &self,
+            query: &FeatureSet,
+            train: &FeatureSet,
+            ratio: f32,
+        ) -> Vec<FeatureMatch> {
+            if ratio < 0.8 {
+                return Vec::new();
+            }
             let count = query.len().min(train.len());
             (0..count)
                 .map(|index| FeatureMatch::new(index, index, 0.1))
@@ -669,6 +727,35 @@ mod tests {
         let stages = stages.lock().unwrap();
         assert!(stages.contains(&StitchStage::Compositing));
         assert!(stages.contains(&StitchStage::Finished));
+    }
+
+    #[test]
+    fn retries_a_pair_with_a_relaxed_match_ratio() {
+        let service = StitchService::new(
+            Arc::new(ScriptedExtractor {
+                queue: Mutex::new(vec![feature_set(20), feature_set(20)]),
+            }),
+            Arc::new(StrictThenRelaxedMatcher),
+            Arc::new(FixedEstimator),
+            Arc::new(SolidCompositor),
+            Arc::new(SystemClock),
+        );
+        let images = vec![source(1), source(2)];
+        let result = service
+            .stitch(
+                &images,
+                &StitchOptions::default(),
+                &stitch_domain::NoProgress,
+            )
+            .unwrap();
+        assert_eq!(result.image.width(), 220);
+        let pair = result
+            .diagnostics
+            .pairs
+            .iter()
+            .find(|pair| pair.used_for_alignment)
+            .expect("the relaxed retry must register the pair");
+        assert_eq!(pair.num_matches, 20);
     }
 
     #[test]
