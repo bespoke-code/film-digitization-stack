@@ -16,13 +16,18 @@ const ANALYSIS_LIMIT: u32 = 1024;
 const FOCUS_TILE_COLUMNS: usize = 8;
 const FOCUS_TILE_ROWS: usize = 8;
 const MIN_FOCUS_WEIGHT: f64 = 0.15;
+/// Fraction of the shorter source side that a frame edge is faded out by when
+/// another frame covers it. Lens falloff and film rebate live in this band.
+const EDGE_CROP_FRACTION: f64 = 0.02;
 
 /// Warps all layers into one RGBA canvas.
 ///
 /// Each layer is sampled through the inverse homography. Overlapping pixels
 /// are averaged with a smooth edge weight and a local focus weight, so a soft
-/// frame cannot smear detail over a sharp one. Rows are processed in bands,
-/// keeping memory independent of the canvas area.
+/// frame cannot smear detail over a sharp one. A frame edge fades out when a
+/// neighbour covers it, which keeps vignetting and rebate out of the blend
+/// without cutting the panorama. Rows are processed in bands, keeping memory
+/// independent of the canvas area.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct BilinearCompositor;
 
@@ -41,8 +46,35 @@ struct PreparedLayer {
     max_x: i64,
     max_y: i64,
     feather: f64,
+    crop: f64,
     focus: FocusMap,
     focus_weight: f64,
+}
+
+impl PreparedLayer {
+    /// How deeply this layer covers the canvas point: zero at the edge of its
+    /// crop band, one a crop band further in, and zero outside the layer. A
+    /// deep neighbour may replace an edge pixel without leaving a hole, and
+    /// ramping this value keeps the handover continuous.
+    fn coverage(&self, canvas_x: f64, canvas_y: f64) -> f64 {
+        if self.crop <= 0.0 {
+            return 0.0;
+        }
+        let Some((x, y)) = inverse_point(&self.inverse, canvas_x, canvas_y) else {
+            return 0.0;
+        };
+        let width = self.image.width() as f64;
+        let height = self.image.height() as f64;
+        if x < 0.0 || y < 0.0 || x > width - 1.0 || y > height - 1.0 {
+            return 0.0;
+        }
+        if self.image.pixel(x.round() as u32, y.round() as u32)[3] == 0 {
+            return 0.0;
+        }
+        let distance = x.min(y).min(width - 1.0 - x).min(height - 1.0 - y);
+        let t = ((distance - self.crop) / self.crop).clamp(0.0, 1.0);
+        t * t * (3.0 - 2.0 * t)
+    }
 }
 
 impl Compositor for BilinearCompositor {
@@ -118,9 +150,27 @@ impl Compositor for BilinearCompositor {
                                     .clamp(MIN_FOCUS_WEIGHT, 1.0)
                                     .min(layer.focus_weight)
                             };
+                            let edge = if distance < layer.crop && layer.crop > 0.0 {
+                                let t = (distance / layer.crop).clamp(0.0, 1.0);
+                                let ramp = t * t * (3.0 - 2.0 * t);
+                                let mut coverage = 0.0f64;
+                                for other in &prepared {
+                                    if std::ptr::eq(other, layer) {
+                                        continue;
+                                    }
+                                    coverage = coverage.max(other.coverage(x as f64, y as f64));
+                                    if coverage >= 1.0 {
+                                        break;
+                                    }
+                                }
+                                1.0 - (1.0 - ramp) * coverage
+                            } else {
+                                1.0
+                            };
                             let weight = (feather_weight(distance, layer.feather) as f64
                                 * sharpness
-                                * alpha as f64) as f32;
+                                * alpha as f64
+                                * edge) as f32;
                             if weight <= 0.0 {
                                 continue;
                             }
@@ -198,8 +248,9 @@ fn prepare_layers(layers: &[WarpLayer], options: &WarpOptions) -> CoreResult<Vec
         let preview = layer.image.resized_to_fit(ANALYSIS_LIMIT);
         let gray = preview.to_gray();
         let focus = FocusMap::new(&gray, FOCUS_TILE_COLUMNS, FOCUS_TILE_ROWS);
-        let feather = (options.feather_fraction.max(0.0) as f64)
-            * layer.image.width().min(layer.image.height()) as f64;
+        let shorter = layer.image.width().min(layer.image.height()) as f64;
+        let feather = (options.feather_fraction.max(0.0) as f64) * shorter;
+        let crop = EDGE_CROP_FRACTION * shorter;
         prepared.push(PreparedLayer {
             image: layer.image.clone(),
             inverse,
@@ -209,6 +260,7 @@ fn prepare_layers(layers: &[WarpLayer], options: &WarpOptions) -> CoreResult<Vec
             max_x,
             max_y,
             feather,
+            crop,
             focus,
             focus_weight: 1.0,
         });
@@ -301,6 +353,66 @@ mod tests {
         assert_eq!(output.pixel(75, 25), [128, 0, 128, 255]);
         assert_eq!(output.pixel(120, 25), [0, 0, 255, 255]);
         assert_eq!(output.pixel(180, 25), [0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn covered_frame_edges_are_cropped_before_blending() {
+        // The last two columns of the red frame are white, like a bright lens
+        // edge. They sit in the crop band and must not lighten the blend.
+        let red = RgbaImage::from_fn(200, 100, |x, _| {
+            if x >= 198 {
+                [255, 255, 255, 255]
+            } else {
+                [255, 0, 0, 255]
+            }
+        });
+        let blue = RgbaImage::filled(200, 100, [0, 0, 255, 255]);
+        let layers = vec![
+            layer(red, Homography::identity()),
+            layer(blue, Homography::translation(100.0, 0.0)),
+        ];
+        let output = BilinearCompositor
+            .composite(
+                &layers,
+                &WarpOptions {
+                    canvas_width: 300,
+                    canvas_height: 100,
+                    feather_fraction: 0.0,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(output.pixel(199, 50), [0, 0, 255, 255]);
+        // Outside the crop band the red frame still blends normally.
+        assert_eq!(output.pixel(196, 50), [128, 0, 128, 255]);
+        // The left edge has no neighbour, so it must survive.
+        assert_eq!(output.pixel(0, 50), [255, 0, 0, 255]);
+    }
+
+    #[test]
+    fn a_narrow_overlap_is_not_cropped_into_a_hole() {
+        let red = RgbaImage::filled(200, 100, [255, 0, 0, 255]);
+        let blue = RgbaImage::filled(200, 100, [0, 0, 255, 255]);
+        let layers = vec![
+            layer(red, Homography::identity()),
+            layer(blue, Homography::translation(199.0, 0.0)),
+        ];
+        let output = BilinearCompositor
+            .composite(
+                &layers,
+                &WarpOptions {
+                    canvas_width: 399,
+                    canvas_height: 100,
+                    feather_fraction: 0.0,
+                },
+            )
+            .unwrap();
+
+        // Both frames meet at their own edge here, so cropping either one
+        // would leave the shared column uncovered.
+        assert_eq!(output.pixel(199, 50)[3], 255);
+        assert_eq!(output.pixel(198, 50), [255, 0, 0, 255]);
+        assert_eq!(output.pixel(200, 50), [0, 0, 255, 255]);
     }
 
     #[test]
