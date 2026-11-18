@@ -82,6 +82,8 @@ pub struct ImagePlacement {
     pub name: String,
     /// Maps source image coordinates into result-canvas coordinates.
     pub homography: Homography,
+    /// Tone curve applied to the image before blending.
+    pub color: ColorCurve,
 }
 
 /// Diagnostics for a candidate registration pair.
@@ -115,6 +117,88 @@ pub struct StitchResult {
     pub diagnostics: StitchDiagnostics,
 }
 
+/// Per-channel tone curve that maps a source image toward its reference.
+///
+/// A single multiplier cannot match two scans whose tone response differs:
+/// the required gain depends on the pixel value. A 256-level lookup table per
+/// channel captures that value dependence and is cheap to apply per pixel.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ColorCurve {
+    lut: [[u8; 256]; 3],
+}
+
+impl Default for ColorCurve {
+    fn default() -> Self {
+        Self::identity()
+    }
+}
+
+impl ColorCurve {
+    pub fn identity() -> Self {
+        let mut lut = [[0u8; 256]; 3];
+        for channel in &mut lut {
+            for (level, entry) in channel.iter_mut().enumerate() {
+                *entry = level as u8;
+            }
+        }
+        Self { lut }
+    }
+
+    /// Builds a curve from a per-channel multiplier, saturating at 255.
+    pub fn from_gain(gain: [f32; 3]) -> Self {
+        let mut curve = Self::identity();
+        for channel in 0..3 {
+            for (level, entry) in curve.lut[channel].iter_mut().enumerate() {
+                let value = level as f32 * gain[channel];
+                *entry = value.round().clamp(0.0, 255.0) as u8;
+            }
+        }
+        curve
+    }
+
+    /// Wraps precomputed lookup tables. Callers are responsible for keeping the
+    /// tables monotone and within range.
+    pub fn from_lut(lut: [[u8; 256]; 3]) -> Self {
+        Self { lut }
+    }
+
+    pub fn is_identity(&self) -> bool {
+        (0..3).all(|channel| {
+            self.lut[channel]
+                .iter()
+                .enumerate()
+                .all(|(level, value)| *value as usize == level)
+        })
+    }
+
+    pub fn channel(&self, channel: usize) -> &[u8; 256] {
+        &self.lut[channel]
+    }
+
+    pub fn lut(&self) -> &[[u8; 256]; 3] {
+        &self.lut
+    }
+
+    /// Returns a curve that applies `self` first and `next` second.
+    pub fn then(&self, next: &Self) -> Self {
+        let mut lut = [[0u8; 256]; 3];
+        for channel in 0..3 {
+            for level in 0..256 {
+                lut[channel][level] = next.lut[channel][self.lut[channel][level] as usize];
+            }
+        }
+        Self { lut }
+    }
+
+    pub fn map(&self, rgb: [u8; 3]) -> [u8; 3] {
+        [
+            self.lut[0][rgb[0] as usize],
+            self.lut[1][rgb[1] as usize],
+            self.lut[2][rgb[2] as usize],
+        ]
+    }
+}
+
 /// A single source layer for the compositor port.
 #[derive(Clone, Debug)]
 pub struct WarpLayer {
@@ -122,8 +206,8 @@ pub struct WarpLayer {
     pub image: Arc<RgbaImage>,
     /// Source image coordinates -> canvas coordinates.
     pub homography: Homography,
-    /// Per-channel multiplier applied before blending.
-    pub gain: [f32; 3],
+    /// Per-channel tone curve applied before blending.
+    pub color: ColorCurve,
 }
 
 /// Parameters passed to the compositor. The canvas size and layer transforms
@@ -194,6 +278,28 @@ impl StitchProgress {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn color_curve_identity_leaves_levels_unchanged() {
+        let curve = ColorCurve::identity();
+        assert!(curve.is_identity());
+        assert_eq!(curve.map([0, 128, 255]), [0, 128, 255]);
+    }
+
+    #[test]
+    fn color_curve_gain_saturates_instead_of_wrapping() {
+        let curve = ColorCurve::from_gain([2.0, 0.5, 1.0]);
+        assert_eq!(curve.map([100, 100, 100]), [200, 50, 100]);
+        assert_eq!(curve.map([200, 255, 10]), [255, 128, 10]);
+    }
+
+    #[test]
+    fn color_curve_composition_applies_in_order() {
+        let brighten = ColorCurve::from_gain([1.5, 1.0, 1.0]);
+        let darken = ColorCurve::from_gain([0.5, 1.0, 1.0]);
+        assert_eq!(brighten.then(&darken).map([100, 100, 100]), [75, 100, 100]);
+        assert_eq!(darken.then(&brighten).map([100, 100, 100]), [75, 100, 100]);
+    }
 
     #[test]
     fn sanitize_clamps_extremes() {

@@ -35,7 +35,7 @@ impl BilinearCompositor {
 struct PreparedLayer {
     image: Arc<RgbaImage>,
     inverse: Homography,
-    gain: [f32; 3],
+    lut: [[u8; 256]; 3],
     min_x: i64,
     min_y: i64,
     max_x: i64,
@@ -125,9 +125,9 @@ impl Compositor for BilinearCompositor {
                                 continue;
                             }
                             let base = x as usize * 3;
-                            rgb_row[base] += color[0] as f32 * layer.gain[0] * weight;
-                            rgb_row[base + 1] += color[1] as f32 * layer.gain[1] * weight;
-                            rgb_row[base + 2] += color[2] as f32 * layer.gain[2] * weight;
+                            rgb_row[base] += layer.lut[0][color[0] as usize] as f32 * weight;
+                            rgb_row[base + 1] += layer.lut[1][color[1] as usize] as f32 * weight;
+                            rgb_row[base + 2] += layer.lut[2][color[2] as usize] as f32 * weight;
                             weight_row[x as usize] += weight;
                         }
                     }
@@ -203,7 +203,7 @@ fn prepare_layers(layers: &[WarpLayer], options: &WarpOptions) -> CoreResult<Vec
         prepared.push(PreparedLayer {
             image: layer.image.clone(),
             inverse,
-            gain: layer.gain,
+            lut: *layer.color.lut(),
             min_x,
             min_y,
             max_x,
@@ -257,7 +257,7 @@ mod tests {
             name: "layer".to_owned(),
             image: Arc::new(image),
             homography: transform,
-            gain: [1.0, 1.0, 1.0],
+            color: stitch_domain::ColorCurve::identity(),
         }
     }
 
@@ -329,10 +329,10 @@ mod tests {
     }
 
     #[test]
-    fn layer_gain_scales_color_before_blending() {
+    fn layer_color_curve_is_applied_before_blending() {
         let dim = RgbaImage::filled(4, 4, [100, 50, 25, 255]);
         let mut warp = layer(dim, Homography::identity());
-        warp.gain = [2.0, 0.5, 1.0];
+        warp.color = stitch_domain::ColorCurve::from_gain([2.0, 0.5, 1.0]);
         let output = BilinearCompositor
             .composite(&[warp], &options(4, 4))
             .unwrap();

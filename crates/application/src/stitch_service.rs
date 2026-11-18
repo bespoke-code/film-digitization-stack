@@ -4,14 +4,16 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use stitch_domain::{
-    Clock, Compositor, CoreError, CoreResult, FeatureExtractor, FeatureMatcher, FeatureSet,
-    GrayImage, Homography, HomographyEstimate, HomographyEstimator, ImagePlacement,
-    PairDiagnostics, ProgressSink, SourceImage, StitchDiagnostics, StitchOptions, StitchProgress,
-    StitchResult, StitchStage, WarpOptions, MAX_IMAGES,
+    Clock, ColorCurve, Compositor, CoreError, CoreResult, FeatureExtractor, FeatureMatcher,
+    FeatureSet, GrayImage, Homography, HomographyEstimate, HomographyEstimator, ImageId,
+    ImagePlacement, PairDiagnostics, Point, ProgressSink, RgbaImage, SourceImage,
+    StitchDiagnostics, StitchOptions, StitchProgress, StitchResult, StitchStage, WarpOptions,
+    MAX_IMAGES,
 };
 
+use crate::bundle::{refine_transforms, PairLink};
 use crate::canvas::plan_canvas;
-use crate::color::estimate_gain;
+use crate::color::calibrate_color_curves;
 
 /// Wall-clock implementation of [`Clock`].
 #[derive(Clone, Copy, Debug, Default)]
@@ -153,6 +155,7 @@ impl StitchService {
                     image_id: images[0].id,
                     name: images[0].name.clone(),
                     homography: Homography::identity(),
+                    color: ColorCurve::identity(),
                 }],
                 diagnostics: StitchDiagnostics {
                     features_per_image: vec![0],
@@ -178,7 +181,7 @@ impl StitchService {
             "Registering images",
         ));
 
-        let (transforms, gains, pairs) =
+        let (transforms, colors, pairs) =
             self.register(images, &analyses, &features, manual, &options, progress)?;
 
         let transforms: Vec<Homography> = transforms
@@ -190,8 +193,8 @@ impl StitchService {
             .collect::<CoreResult<Vec<_>>>()?;
 
         let mut plan = plan_canvas(images, &transforms, &options)?;
-        for (layer, gain) in plan.layers.iter_mut().zip(gains.iter()) {
-            layer.gain = *gain;
+        for (layer, color) in plan.layers.iter_mut().zip(colors.iter()) {
+            layer.color = color.clone();
         }
         progress.report(StitchProgress::new(
             StitchStage::Compositing,
@@ -214,6 +217,7 @@ impl StitchService {
                 image_id: image.id,
                 name: image.name.clone(),
                 homography: layer.homography,
+                color: layer.color.clone(),
             })
             .collect();
 
@@ -287,8 +291,9 @@ impl StitchService {
     ) -> CoreResult<Registration> {
         let mut transforms: Vec<Option<Homography>> = vec![None; images.len()];
         transforms[0] = Some(Homography::identity());
-        let mut gains = vec![[1.0f32; 3]; images.len()];
         let mut diagnostics = Vec::new();
+        let mut links: Vec<PairLink> = Vec::new();
+        let mut evaluated: Vec<(usize, usize)> = Vec::new();
 
         for index in 1..images.len() {
             progress.report(StitchProgress::new(
@@ -314,6 +319,7 @@ impl StitchService {
             let primary_count = candidates.len().min(2);
             let mut best: Option<Candidate> = None;
             for (attempt, &target) in candidates.iter().enumerate() {
+                evaluated.push(ordered_pair(index, target));
                 let evaluation = self.evaluate_pair(
                     index,
                     target,
@@ -324,6 +330,7 @@ impl StitchService {
                     &mut diagnostics,
                 );
                 if let Some(candidate) = evaluation {
+                    push_link(&mut links, &diagnostics, index, &candidate);
                     if best
                         .as_ref()
                         .map(|current| candidate.inliers > current.inliers)
@@ -349,12 +356,6 @@ impl StitchService {
                     ))
                 })?;
                 transforms[index] = Some(parent.then(&chosen.homography));
-                let parent_gain = gains[chosen.target];
-                gains[index] = [
-                    parent_gain[0] * chosen.gain[0],
-                    parent_gain[1] * chosen.gain[1],
-                    parent_gain[2] * chosen.gain[2],
-                ];
                 continue;
             }
 
@@ -365,18 +366,58 @@ impl StitchService {
                 .filter(Homography::is_finite)
                 .ok_or_else(|| CoreError::NotEnoughOverlap(images[index].name.clone()))?;
             transforms[index] = Some(placement);
-            gains[index] = if options.normalize_colors {
-                estimate_gain(
-                    images[index].image.as_ref(),
-                    images[0].image.as_ref(),
-                    &placement,
-                )
-            } else {
-                [1.0; 3]
-            };
         }
 
-        Ok((transforms, gains, diagnostics))
+        // The tree only evaluates a few neighbours. Every remaining overlap
+        // still reaches the compositor, so evaluate the pairs whose canvas
+        // bounds intersect and give all of them to the global fit.
+        let registered: Vec<Homography> = transforms
+            .iter()
+            .map(|transform| transform.expect("every image is registered"))
+            .collect();
+        for first in 0..images.len() {
+            for second in (first + 1)..images.len() {
+                if evaluated.contains(&ordered_pair(first, second)) {
+                    continue;
+                }
+                if overlap_fraction(
+                    &registered[first],
+                    &registered[second],
+                    images[first].image.as_ref(),
+                    images[second].image.as_ref(),
+                ) < 0.02
+                {
+                    continue;
+                }
+                evaluated.push(ordered_pair(first, second));
+                if let Some(candidate) = self.evaluate_pair(
+                    second,
+                    first,
+                    images,
+                    analyses,
+                    features,
+                    options,
+                    &mut diagnostics,
+                ) {
+                    push_link(&mut links, &diagnostics, second, &candidate);
+                }
+            }
+        }
+
+        let sizes: Vec<(f64, f64)> = images
+            .iter()
+            .map(|image| (image.image.width() as f64, image.image.height() as f64))
+            .collect();
+        let refined = refine_transforms(&registered, &sizes, &links);
+        let transforms: Vec<Option<Homography>> = refined.into_iter().map(Some).collect();
+
+        let colors = if options.normalize_colors {
+            calibrate_registered_colors(images, &transforms, &diagnostics)
+        } else {
+            vec![ColorCurve::identity(); images.len()]
+        };
+
+        Ok((transforms, colors, diagnostics))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -466,20 +507,9 @@ impl StitchService {
         let homography =
             to_original_coordinates(&estimate, &analyses[query_index], &analyses[target_index])?;
 
-        let gain = if options.normalize_colors {
-            estimate_gain(
-                images[query_index].image.as_ref(),
-                images[target_index].image.as_ref(),
-                &homography,
-            )
-        } else {
-            [1.0; 3]
-        };
-
         Some(Candidate {
             target: target_index,
             homography,
-            gain,
             inliers: estimate.inliers.len(),
             diagnostic_index,
         })
@@ -530,15 +560,129 @@ fn rotate_images(images: &[SourceImage], rotations: &[f32]) -> Vec<SourceImage> 
         .collect()
 }
 
-/// Per-image transforms, color gains and pair diagnostics.
-type Registration = (Vec<Option<Homography>>, Vec<[f32; 3]>, Vec<PairDiagnostics>);
+/// Per-image transforms, color curves and pair diagnostics.
+type Registration = (
+    Vec<Option<Homography>>,
+    Vec<ColorCurve>,
+    Vec<PairDiagnostics>,
+);
 
 struct Candidate {
     target: usize,
     homography: Homography,
-    gain: [f32; 3],
     inliers: usize,
     diagnostic_index: usize,
+}
+
+/// Builds the overlap list from the tree pairs and calibrates all images at
+/// once. Pair transforms come from the final canvas transforms so the
+/// calibration matches what the compositor actually blends.
+///
+/// Only the tree pairs feed the calibration. They are the large, centred
+/// overlaps that the registration chose, and they are the only ones where both
+/// frames see the same part of the negative through the same part of the lens.
+/// Long-range pairs meet at frame corners, where vignetting mimics an exposure
+/// difference and would distort a whole frame's curve.
+fn calibrate_registered_colors(
+    images: &[SourceImage],
+    transforms: &[Option<Homography>],
+    diagnostics: &[PairDiagnostics],
+) -> Vec<ColorCurve> {
+    let mut overlaps = Vec::new();
+    for pair in diagnostics
+        .iter()
+        .filter(|pair| pair.accepted && pair.used_for_alignment)
+    {
+        let Some(query) = image_index(images, pair.from) else {
+            continue;
+        };
+        let Some(target) = image_index(images, pair.to) else {
+            continue;
+        };
+        let (Some(query_transform), Some(target_transform)) =
+            (transforms[query].as_ref(), transforms[target].as_ref())
+        else {
+            continue;
+        };
+        let Some(target_inverse) = target_transform.inverse() else {
+            continue;
+        };
+        overlaps.push((query, target, target_inverse.then(query_transform)));
+    }
+
+    let images: Vec<&RgbaImage> = images.iter().map(|image| image.image.as_ref()).collect();
+    calibrate_color_curves(&images, &overlaps)
+}
+
+fn image_index(images: &[SourceImage], id: ImageId) -> Option<usize> {
+    images.iter().position(|image| image.id == id)
+}
+
+fn ordered_pair(a: usize, b: usize) -> (usize, usize) {
+    if a < b {
+        (a, b)
+    } else {
+        (b, a)
+    }
+}
+
+fn push_link(
+    links: &mut Vec<PairLink>,
+    diagnostics: &[PairDiagnostics],
+    query: usize,
+    candidate: &Candidate,
+) {
+    let rms = diagnostics
+        .get(candidate.diagnostic_index)
+        .map(|pair| pair.rms_error)
+        .unwrap_or(0.0);
+    links.push(PairLink {
+        query,
+        target: candidate.target,
+        homography: candidate.homography,
+        weight: candidate.inliers as f64 / (1.0 + rms),
+    });
+}
+
+fn overlap_fraction(
+    first: &Homography,
+    second: &Homography,
+    first_image: &RgbaImage,
+    second_image: &RgbaImage,
+) -> f64 {
+    let (Some(first_quad), Some(second_quad)) = (
+        first.transform_quad(first_image.width(), first_image.height()),
+        second.transform_quad(second_image.width(), second_image.height()),
+    ) else {
+        return 0.0;
+    };
+    let first_box = bounds(&first_quad);
+    let second_box = bounds(&second_quad);
+    let width = (first_box.2.min(second_box.2) - first_box.0.max(second_box.0)).max(0.0);
+    let height = (first_box.3.min(second_box.3) - first_box.1.max(second_box.1)).max(0.0);
+    let intersection = width * height;
+    let first_area = (first_box.2 - first_box.0) * (first_box.3 - first_box.1);
+    let second_area = (second_box.2 - second_box.0) * (second_box.3 - second_box.1);
+    let smaller = first_area.min(second_area);
+    if smaller <= 0.0 {
+        0.0
+    } else {
+        intersection / smaller
+    }
+}
+
+fn bounds(quad: &[Point; 4]) -> (f64, f64, f64, f64) {
+    let mut min_x = f64::MAX;
+    let mut min_y = f64::MAX;
+    let mut max_x = f64::MIN;
+    let mut max_y = f64::MIN;
+    for point in quad {
+        min_x = min_x.min(point.x);
+        min_y = min_y.min(point.y);
+        max_x = max_x.max(point.x);
+        max_y = max_y.max(point.y);
+    }
+    (min_x, min_y, max_x, max_y)
 }
 
 fn to_gray(image: &stitch_domain::RgbaImage) -> GrayImage {

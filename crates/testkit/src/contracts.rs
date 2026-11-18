@@ -7,9 +7,9 @@
 use std::sync::Arc;
 
 use stitch_domain::{
-    Clock, Compositor, CoreError, FeatureExtractor, FeatureMatch, FeatureMatcher, Homography,
-    HomographyEstimator, ImageLocator, ImageRepository, Point, RgbaImage, StitchOptions, WarpLayer,
-    WarpOptions,
+    Clock, ColorCurve, Compositor, CoreError, FeatureExtractor, FeatureMatch, FeatureMatcher,
+    Homography, HomographyEstimator, ImageLocator, ImageRepository, Point, RgbaImage,
+    StitchOptions, WarpLayer, WarpOptions,
 };
 
 use crate::fixtures::{features_at_points, grid_points, textured_gray, textured_rgba};
@@ -170,7 +170,7 @@ pub fn compositor_contract(compositor: &dyn Compositor) {
                 name: "single".to_owned(),
                 image: Arc::new(image.clone()),
                 homography: Homography::identity(),
-                gain: [1.0, 1.0, 1.0],
+                color: ColorCurve::identity(),
             }],
             &options,
         )
@@ -188,13 +188,13 @@ pub fn compositor_contract(compositor: &dyn Compositor) {
                     name: "red".to_owned(),
                     image: Arc::new(red),
                     homography: Homography::identity(),
-                    gain: [1.0, 1.0, 1.0],
+                    color: ColorCurve::identity(),
                 },
                 WarpLayer {
                     name: "blue".to_owned(),
                     image: Arc::new(blue),
                     homography: Homography::translation(50.0, 0.0),
-                    gain: [1.0, 1.0, 1.0],
+                    color: ColorCurve::identity(),
                 },
             ],
             &WarpOptions {

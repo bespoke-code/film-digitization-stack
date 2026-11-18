@@ -103,7 +103,7 @@ pub fn plan_canvas(
             name: image.name.clone(),
             image: image.image.clone(),
             homography: normalize.then(transform),
-            gain: [1.0, 1.0, 1.0],
+            color: stitch_domain::ColorCurve::identity(),
         })
         .collect();
 

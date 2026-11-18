@@ -40,6 +40,6 @@ pub use ports::{
 pub use project::{ImageId, ImageLocator, Project, SourceImage, MAX_IMAGES};
 pub use quality::{laplacian_variance, FocusMap};
 pub use stitch::{
-    HomographyEstimate, ImagePlacement, PairDiagnostics, StitchDiagnostics, StitchOptions,
-    StitchProgress, StitchResult, StitchStage, WarpLayer, WarpOptions,
+    ColorCurve, HomographyEstimate, ImagePlacement, PairDiagnostics, StitchDiagnostics,
+    StitchOptions, StitchProgress, StitchResult, StitchStage, WarpLayer, WarpOptions,
 };
