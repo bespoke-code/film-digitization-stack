@@ -10,8 +10,8 @@ use image::{
     RgbaImage as ImageRgbaImage,
 };
 use stitch_domain::{
-    CoreError, CoreResult, ImageLocator, ImageRepository, LoadedImage, PhotoMetadata, RgbaImage,
-    SaveOptions,
+    CoreError, CoreResult, ImageLocator, ImageRepository, LoadEstimate, LoadedImage, PhotoMetadata,
+    RgbaImage, SaveOptions,
 };
 
 use crate::jpeg::jpeg_quality;
@@ -114,6 +114,25 @@ impl ImageRepository for FileImageRepository {
             thumbnail,
             metadata,
             jpeg_quality,
+        })
+    }
+
+    /// Reads only the header. The peak covers the file bytes, the decoder's
+    /// native buffer and the RGBA copy that becomes the loaded image.
+    fn estimate_load(&self, locator: &ImageLocator) -> Option<LoadEstimate> {
+        let path = Self::path(locator);
+        let file_bytes = std::fs::metadata(path).ok()?.len();
+        let decoder = ImageReader::open(path)
+            .ok()?
+            .with_guessed_format()
+            .ok()?
+            .into_decoder()
+            .ok()?;
+        let (width, height) = decoder.dimensions();
+        let retained = u64::from(width) * u64::from(height) * 4;
+        Some(LoadEstimate {
+            retained,
+            peak: file_bytes + decoder.total_bytes() + retained,
         })
     }
 
@@ -405,6 +424,22 @@ mod tests {
             loaded.thumbnail.width() < loaded.thumbnail.height(),
             "the thumbnail must be upright too"
         );
+    }
+
+    #[test]
+    fn load_estimate_covers_the_decoded_image() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("estimate.png");
+        let locator = ImageLocator::new(path.to_string_lossy());
+        let repository = FileImageRepository::default();
+        repository
+            .save(&locator, &RgbaImage::filled(40, 30, [1, 2, 3, 255]))
+            .unwrap();
+        let estimate = repository.estimate_load(&locator).unwrap();
+        assert_eq!(estimate.retained, 40 * 30 * 4);
+        assert!(estimate.peak > estimate.retained);
+        let missing = ImageLocator::new(dir.path().join("none.png").to_string_lossy());
+        assert_eq!(repository.estimate_load(&missing), None);
     }
 
     #[test]

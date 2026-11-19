@@ -39,12 +39,29 @@ impl Default for SaveOptions {
     }
 }
 
+/// Memory needed to load one image, in bytes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LoadEstimate {
+    /// Memory the loaded image keeps afterwards.
+    pub retained: u64,
+    /// Highest memory use while the image loads, including `retained`.
+    pub peak: u64,
+}
+
 /// Durable storage for source images and exported results.
 ///
 /// Native adapters use the filesystem, browser adapters use fetch/object URLs
 /// and tests use memory.
 pub trait ImageRepository: Send + Sync {
     fn load(&self, locator: &ImageLocator) -> CoreResult<LoadedImage>;
+
+    /// Estimates the memory a load needs without decoding the pixels.
+    /// `None` means the adapter cannot tell, for example because the image is
+    /// already in memory.
+    fn estimate_load(&self, locator: &ImageLocator) -> Option<LoadEstimate> {
+        let _ = locator;
+        None
+    }
     fn save(&self, locator: &ImageLocator, image: &RgbaImage) -> CoreResult<()>;
 
     /// Saves an image using the given encoder settings.

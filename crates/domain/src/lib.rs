@@ -34,7 +34,7 @@ pub use image::{GrayImage, RgbaImage};
 pub use metadata::PhotoMetadata;
 pub use ports::{
     Clock, Compositor, FeatureExtractor, FeatureMatcher, HomographyEstimator, ImageRepository,
-    LoadedImage, NoProgress, ProgressSink, Renderer, SaveOptions, SharedCompositor,
+    LoadEstimate, LoadedImage, NoProgress, ProgressSink, Renderer, SaveOptions, SharedCompositor,
     SharedEstimator, SharedExtractor, SharedMatcher, SharedRepository, DEFAULT_JPEG_QUALITY,
 };
 pub use project::{ImageId, ImageLocator, Project, SourceImage, MAX_IMAGES};

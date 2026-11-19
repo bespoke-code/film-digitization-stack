@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use stitch_application::{ProjectService, StitchService, SystemClock};
-use stitch_imaging::{BilinearCompositor, CacheDir, FileImageRepository};
+use stitch_imaging::{memory_budget, BilinearCompositor, CacheDir, FileImageRepository};
 use stitch_ui_egui::ScanToImgApp;
 use stitch_vision::{RansacHomographyEstimator, RatioMatcher, SiftExtractor};
 
@@ -26,7 +26,9 @@ fn main() -> eframe::Result<()> {
     };
 
     let repository = Arc::new(FileImageRepository::default());
-    let project_service = ProjectService::new(repository);
+    let budget = memory_budget();
+    log::debug!("memory budget: {} MiB", budget >> 20);
+    let project_service = ProjectService::new(repository).with_memory_budget(budget);
 
     let stitch_service = StitchService::new(
         Arc::new(SiftExtractor::default()),

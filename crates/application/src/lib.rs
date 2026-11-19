@@ -14,5 +14,5 @@ pub mod stitch_service;
 pub use bundle::{refine_transforms, PairLink};
 pub use canvas::{plan_canvas, CanvasPlan};
 pub use color::calibrate_color_curves;
-pub use library::ProjectService;
+pub use library::{ProjectService, DEFAULT_MEMORY_BUDGET};
 pub use stitch_service::{StitchService, SystemClock};
