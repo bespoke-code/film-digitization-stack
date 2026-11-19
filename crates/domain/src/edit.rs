@@ -777,9 +777,12 @@ fn channel_transform(
     rgb_tangents: &[f32],
 ) -> f32 {
     if settings.invert {
+        // The film base is the clearest part of the negative and marks scene
+        // black. Dividing by it removes the orange mask per channel, so the
+        // base maps to black and dense areas map to white after inversion.
         if let Some(base) = settings.film_base {
-            let base = base[channel] as f32 / 255.0;
-            normalized = ((normalized - base) / (1.0 - base).max(1e-4)).clamp(0.0, 1.0);
+            let base = (base[channel] as f32 / 255.0).max(1e-4);
+            normalized = (normalized / base).clamp(0.0, 1.0);
         }
         normalized = 1.0 - normalized;
     }
@@ -987,13 +990,11 @@ mod tests {
     }
 
     #[test]
-    fn film_base_becomes_white_and_dense_negative_becomes_black() {
-        let image = RgbaImage::from_fn(2, 1, |x, _| {
-            if x == 0 {
-                [120, 80, 40, 255]
-            } else {
-                [255, 255, 255, 255]
-            }
+    fn film_base_becomes_black_and_dense_negative_becomes_white() {
+        let image = RgbaImage::from_fn(3, 1, |x, _| match x {
+            0 => [120, 80, 40, 255],
+            1 => [0, 0, 0, 255],
+            _ => [60, 40, 20, 255],
         });
         let settings = EditSettings {
             invert: true,
@@ -1001,8 +1002,29 @@ mod tests {
             ..EditSettings::default()
         };
         let developed = settings.develop(&image);
-        assert_eq!(developed.pixel(0, 0), [255, 255, 255, 255]);
-        assert_eq!(developed.pixel(1, 0), [0, 0, 0, 255]);
+        assert_eq!(developed.pixel(0, 0), [0, 0, 0, 255]);
+        assert_eq!(developed.pixel(1, 0), [255, 255, 255, 255]);
+        // Half the base density is a neutral mid grey: the mask is removed.
+        let mid = developed.pixel(2, 0);
+        assert!(mid[0] == mid[1] && mid[1] == mid[2], "{mid:?}");
+        assert!((mid[0] as i32 - 128).abs() <= 1, "{mid:?}");
+    }
+
+    #[test]
+    fn image_content_darker_than_the_base_keeps_its_tones() {
+        let image = RgbaImage::from_fn(64, 1, |x, _| {
+            let level = (x * 3) as u8;
+            [level, level, level, 255]
+        });
+        let settings = EditSettings {
+            invert: true,
+            film_base: Some([200, 200, 200]),
+            ..EditSettings::default()
+        };
+        let developed = settings.develop(&image);
+        let distinct: std::collections::BTreeSet<u8> =
+            (0..64).map(|x| developed.pixel(x, 0)[0]).collect();
+        assert!(distinct.len() > 60, "tones collapsed: {distinct:?}");
     }
 
     #[test]

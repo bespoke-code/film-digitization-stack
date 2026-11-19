@@ -23,19 +23,22 @@ pub struct PhotoMetadata {
 
 impl PhotoMetadata {
     /// Trims every field and limits its length.
-    pub fn sanitized(self) -> Self {
-        let mut metadata = self.bounded();
-        metadata.camera = metadata.camera.trim().to_owned();
-        metadata.lens = metadata.lens.trim().to_owned();
-        metadata.film = metadata.film.trim().to_owned();
-        metadata.iso = metadata.iso.trim().to_owned();
-        metadata.aperture = metadata.aperture.trim().to_owned();
-        metadata.shutter_speed = metadata.shutter_speed.trim().to_owned();
-        metadata.focal_length = metadata.focal_length.trim().to_owned();
-        metadata.date = metadata.date.trim().to_owned();
-        metadata.location = metadata.location.trim().to_owned();
-        metadata.notes = metadata.notes.trim().to_owned();
-        metadata
+    pub fn sanitized(mut self) -> Self {
+        for field in [
+            &mut self.camera,
+            &mut self.lens,
+            &mut self.film,
+            &mut self.iso,
+            &mut self.aperture,
+            &mut self.shutter_speed,
+            &mut self.focal_length,
+            &mut self.date,
+            &mut self.location,
+            &mut self.notes,
+        ] {
+            *field = bound(field.trim()).trim_end().to_owned();
+        }
+        self
     }
 
     /// Limits the length without trimming so text fields stay editable.
@@ -145,6 +148,16 @@ mod tests {
         .sanitized();
         assert_eq!(metadata.camera, "Nikon FM2");
         assert_eq!(metadata.notes.chars().count(), MAX_FIELD_LEN);
+    }
+
+    #[test]
+    fn leading_whitespace_does_not_use_up_the_length_limit() {
+        let metadata = PhotoMetadata {
+            notes: format!("{}kept", " ".repeat(MAX_FIELD_LEN)),
+            ..PhotoMetadata::default()
+        }
+        .sanitized();
+        assert_eq!(metadata.notes, "kept");
     }
 
     #[test]

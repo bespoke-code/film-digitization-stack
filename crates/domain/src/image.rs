@@ -379,7 +379,7 @@ impl GrayImage {
             / self.data.len().max(1) as f32
     }
 
-    /// Bilinear sample in normalized image coordinates.
+    /// Bilinear sample in pixel coordinates. Outside the image returns `None`.
     pub fn sample(&self, x: f64, y: f64) -> Option<f32> {
         if !x.is_finite() || !y.is_finite() || x < 0.0 || y < 0.0 {
             return None;

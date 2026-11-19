@@ -1024,6 +1024,26 @@ fn parse_labeled_comment(text: &str) -> PhotoMetadata {
         };
         let label = label.trim().to_ascii_lowercase();
         let value = value.trim();
+        let known = matches!(
+            label.as_str(),
+            "camera"
+                | "lens"
+                | "film"
+                | "iso"
+                | "aperture"
+                | "shutter"
+                | "shutter speed"
+                | "focal length"
+                | "date"
+                | "location"
+                | "notes"
+        );
+        if in_notes && !known {
+            // A note line may contain a colon, such as a time or a ratio.
+            metadata.notes.push('\n');
+            metadata.notes.push_str(line);
+            continue;
+        }
         in_notes = false;
         match label.as_str() {
             "camera" => metadata.camera = value.to_owned(),
@@ -1242,6 +1262,18 @@ mod tests {
         let parsed = parse_labeled_comment("Camera: Nikon FM2\nNotes: first line\nsecond line");
         assert_eq!(parsed.camera, "Nikon FM2");
         assert_eq!(parsed.notes, "first line\nsecond line");
+    }
+
+    #[test]
+    fn note_lines_with_colons_are_kept() {
+        let parsed = parse_labeled_comment(
+            "Notes: pushed one stop\nDeveloped at 20:30 in HC-110 1:31\nLocation: Berlin",
+        );
+        assert_eq!(
+            parsed.notes,
+            "pushed one stop\nDeveloped at 20:30 in HC-110 1:31"
+        );
+        assert_eq!(parsed.location, "Berlin");
     }
 
     #[test]

@@ -421,6 +421,10 @@ impl ScanToImgApp {
     }
 
     fn add_paths(&mut self, paths: Vec<PathBuf>) {
+        if self.workbench.is_busy() {
+            self.pending_paths.extend(paths);
+            return;
+        }
         let mut images = Vec::new();
         let mut raw_files = 0usize;
         for path in paths {
@@ -500,7 +504,7 @@ impl ScanToImgApp {
                         self.workbench.notify(
                             "RAW files are not supported yet. Convert them to TIFF, JPEG or PNG first.",
                         );
-                    } else {
+                    } else if !self.workbench.is_busy() {
                         self.workbench.fail_stitch(format!(
                             "No supported images were found in {}.",
                             folder.display()
@@ -571,7 +575,10 @@ impl ScanToImgApp {
 
             let add_label = format!("Add images ({} left)", self.workbench.remaining_slots());
             if ui
-                .add_enabled(self.workbench.can_add(), egui::Button::new(add_label))
+                .add_enabled(
+                    self.workbench.can_add() && !self.workbench.is_busy(),
+                    egui::Button::new(add_label),
+                )
                 .clicked()
             {
                 self.dialog.open_in(
@@ -581,7 +588,10 @@ impl ScanToImgApp {
                     self.workbench.default_export_jpeg_quality(),
                 );
             }
-            if ui.button("Open folder").clicked() {
+            if ui
+                .add_enabled(!self.workbench.is_busy(), egui::Button::new("Open folder"))
+                .clicked()
+            {
                 self.dialog.open_in(
                     DialogMode::OpenFolder,
                     None,
@@ -591,7 +601,7 @@ impl ScanToImgApp {
             }
             if ui
                 .add_enabled(
-                    self.workbench.selected().is_some(),
+                    self.workbench.selected().is_some() && !self.workbench.is_busy(),
                     egui::Button::new("Remove"),
                 )
                 .clicked()
@@ -1518,11 +1528,19 @@ impl ScanToImgApp {
                 if image_rect.contains(position) {
                     let normalized_x = (position.x - image_rect.left()) / image_rect.width();
                     let normalized_y = (position.y - image_rect.top()) / image_rect.height();
-                    if let Some(base) = self.workbench.base_preview() {
+                    // With edits shown, the viewport shows the rotated and
+                    // cropped source; "Original" shows the untouched source.
+                    let showing_edits = self.workbench.show_edits();
+                    let base = if showing_edits {
+                        self.workbench.base_preview()
+                    } else {
+                        self.workbench.preview()
+                    };
+                    if let Some(base) = base {
                         let settings = self.workbench.current_edits();
                         let crop = settings
                             .crop
-                            .filter(|_| self.workbench.show_edits())
+                            .filter(|_| showing_edits)
                             .and_then(|crop| crop.clamped(base.image.width(), base.image.height()));
                         let (x, y) = match crop {
                             Some(crop) => (
@@ -1552,10 +1570,6 @@ impl eframe::App for ScanToImgApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.poll_worker();
-        if !self.pending_paths.is_empty() {
-            let paths = std::mem::take(&mut self.pending_paths);
-            self.add_paths(paths);
-        }
         let dropped: Vec<PathBuf> = ctx.input(|input| {
             input
                 .raw
@@ -1564,8 +1578,12 @@ impl eframe::App for ScanToImgApp {
                 .map(|file| file.path().to_path_buf())
                 .collect()
         });
-        if !dropped.is_empty() {
-            self.add_paths(dropped);
+        // Files dropped during a stitch wait until the worker finishes, so the
+        // panorama always belongs to the images it was computed from.
+        self.pending_paths.extend(dropped);
+        if !self.pending_paths.is_empty() && !self.workbench.is_busy() {
+            let paths = std::mem::take(&mut self.pending_paths);
+            self.add_paths(paths);
         }
 
         if let Some(outcome) = self.dialog.show(&ctx) {

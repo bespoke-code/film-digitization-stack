@@ -5,8 +5,8 @@
 //! what makes swapping the UI framework feasible.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
-use std::path::Path;
+use std::collections::{HashMap, HashSet};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 use stitch_application::{ProjectService, StitchService};
@@ -427,12 +427,17 @@ impl Workbench {
         if self.project.get(id).is_none() {
             return;
         }
-        let settings = settings.sanitized();
+        let mut settings = settings.sanitized();
         let rotation_changed = self
             .edits
             .get(&id)
             .map(|current| (current.rotation - settings.rotation).abs() > f32::EPSILON)
             .unwrap_or(settings.rotation != 0.0);
+        if rotation_changed {
+            // The crop is in rotated pixel coordinates and would select an
+            // unrelated region after the rotation changes.
+            settings.crop = None;
+        }
         if self.edits.get(&id) != Some(&settings) {
             self.edits.insert(id, settings);
             if rotation_changed {
@@ -449,7 +454,10 @@ impl Workbench {
     pub fn update_current_edits(&mut self, settings: EditSettings) {
         match self.preview_target {
             PreviewTarget::Stitched => {
-                let settings = settings.sanitized();
+                let mut settings = settings.sanitized();
+                if (self.result_edits.rotation - settings.rotation).abs() > f32::EPSILON {
+                    settings.crop = None;
+                }
                 if self.result_edits != settings {
                     self.result_edits = settings;
                     self.bump_revision();
@@ -461,21 +469,18 @@ impl Workbench {
 
     /// Copies the given adjustments to every loaded image for batch work.
     ///
-    /// The crop is intentionally left alone because it is defined in each
-    /// image's own pixel coordinates. The stitched panorama receives the same
-    /// tone and color settings.
+    /// Each target keeps its own crop and rotation because both are defined
+    /// in that image's own pixel coordinates. The stitched panorama receives
+    /// the same tone and color settings.
     pub fn apply_edits_to_all(&mut self, settings: EditSettings) {
-        let mut settings = settings.sanitized();
-        settings.crop = None;
+        let settings = settings.sanitized();
         let mut changed = false;
         for image in self.project.images() {
             let mut target = settings.clone();
-            target.rotation = self
-                .edits
-                .get(&image.id)
-                .map(|current| current.rotation)
-                .unwrap_or(0.0);
-            if self.edits.get(&image.id) != Some(&target) {
+            let current = self.edits.get(&image.id);
+            target.rotation = current.map(|current| current.rotation).unwrap_or(0.0);
+            target.crop = current.and_then(|current| current.crop);
+            if current != Some(&target) {
                 self.edits.insert(image.id, target);
                 changed = true;
             }
@@ -483,6 +488,7 @@ impl Workbench {
         if self.result.is_some() {
             let mut target = settings.clone();
             target.rotation = self.result_edits.rotation;
+            target.crop = self.result_edits.crop;
             if self.result_edits != target {
                 self.result_edits = target;
                 changed = true;
@@ -540,7 +546,7 @@ impl Workbench {
 
     pub fn update_options(&mut self, options: StitchOptions) {
         let options = options.sanitized();
-        if options != self.options {
+        if options != self.options && !self.is_busy() {
             self.options = options;
             self.invalidate_result();
             self.set_status(WorkbenchStatus::Ready(
@@ -558,6 +564,7 @@ impl Workbench {
         if locators.is_empty() {
             return Ok(Vec::new());
         }
+        self.ensure_idle()?;
         if self.project.is_full() {
             return Err(CoreError::TooManyImages { max: MAX_IMAGES });
         }
@@ -587,6 +594,7 @@ impl Workbench {
     }
 
     pub fn remove_image(&mut self, id: ImageId) -> CoreResult<()> {
+        self.ensure_idle()?;
         self.project.remove(id)?;
         self.edits.remove(&id);
         self.metadata.remove(&id);
@@ -611,6 +619,7 @@ impl Workbench {
     }
 
     pub fn move_up(&mut self, id: ImageId) -> CoreResult<()> {
+        self.ensure_idle()?;
         self.project.move_up(id)?;
         self.manual.clear();
         self.invalidate_result();
@@ -619,6 +628,7 @@ impl Workbench {
     }
 
     pub fn move_down(&mut self, id: ImageId) -> CoreResult<()> {
+        self.ensure_idle()?;
         self.project.move_down(id)?;
         self.manual.clear();
         self.invalidate_result();
@@ -627,6 +637,9 @@ impl Workbench {
     }
 
     pub fn clear(&mut self) {
+        if self.is_busy() {
+            return;
+        }
         self.project.clear();
         self.selected = None;
         self.result = None;
@@ -740,11 +753,7 @@ impl Workbench {
         if self.project.is_empty() {
             return Err(CoreError::EmptyProject);
         }
-        if self.is_busy() {
-            return Err(CoreError::InvalidImage(
-                "a stitch operation is already running".to_owned(),
-            ));
-        }
+        self.ensure_idle()?;
         self.set_status(WorkbenchStatus::Busy {
             stage: StitchStage::ExtractingFeatures,
             fraction: Some(0.0),
@@ -893,6 +902,7 @@ impl Workbench {
         options: &SaveOptions,
     ) -> CoreResult<()> {
         let (base, _) = self.base_image().ok_or(CoreError::NoStitchResult)?;
+        self.ensure_not_source(locator)?;
         let image = self.current_edits().develop(&base);
         service.export_with_metadata_and_options(
             locator,
@@ -929,32 +939,53 @@ impl Workbench {
         if self.project.is_empty() {
             return Err(CoreError::EmptyProject);
         }
-        let mut written = 0;
+        let mut used = HashSet::new();
+        let mut destination = |stem: String, suffix: &str| {
+            let mut candidate = folder.join(format!("{stem}-{suffix}.{extension}"));
+            let mut counter = 2;
+            while !used.insert(comparable_path(&candidate.to_string_lossy())) {
+                candidate = folder.join(format!("{stem}-{suffix}-{counter}.{extension}"));
+                counter += 1;
+            }
+            ImageLocator::from(candidate.as_path())
+        };
+        let mut jobs = Vec::with_capacity(self.project.len() + 1);
         for image in self.project.images() {
-            let stem = export_stem(&image.locator, image.id.0);
-            let path = folder.join(format!("{stem}-edited.{extension}"));
-            let developed = self.edits(image.id).develop(&image.image);
-            service.export_with_metadata_and_options(
-                &ImageLocator::from(path.as_path()),
-                &developed,
-                Some(&self.image_metadata(image.id)),
-                options,
-            )?;
-            written += 1;
+            let locator = destination(export_stem(&image.locator, image.id.0), "edited");
+            jobs.push((locator, Some(image)));
         }
-        if let Some(result) = &self.result {
+        if self.result.is_some() {
             let stem = self
                 .project
                 .images()
                 .first()
                 .map(|image| export_stem(&image.locator, image.id.0))
                 .unwrap_or_else(|| "panorama".to_owned());
-            let path = folder.join(format!("{stem}-stitched.{extension}"));
-            let developed = self.result_edits.develop(&result.image);
+            jobs.push((destination(stem, "stitched"), None));
+        }
+        // Check every name first so a refused file does not leave a partial
+        // batch behind.
+        for (locator, _) in &jobs {
+            self.ensure_not_source(locator)?;
+        }
+
+        let mut written = 0;
+        for (locator, image) in jobs {
+            let (developed, metadata) = match (image, &self.result) {
+                (Some(image), _) => (
+                    self.edits(image.id).develop(&image.image),
+                    self.image_metadata(image.id),
+                ),
+                (None, Some(result)) => (
+                    self.result_edits.develop(&result.image),
+                    self.result_metadata.clone(),
+                ),
+                (None, None) => continue,
+            };
             service.export_with_metadata_and_options(
-                &ImageLocator::from(path.as_path()),
+                &locator,
                 &developed,
-                Some(&self.result_metadata),
+                Some(&metadata),
                 options,
             )?;
             written += 1;
@@ -982,6 +1013,30 @@ impl Workbench {
                 Err(error)
             }
         }
+    }
+
+    /// The worker stitches a snapshot of the project. Changing the project
+    /// meanwhile would attach the finished panorama to different images.
+    fn ensure_idle(&self) -> CoreResult<()> {
+        if self.is_busy() {
+            Err(CoreError::Busy)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Refuses a destination that is one of the loaded source files.
+    fn ensure_not_source(&self, locator: &ImageLocator) -> CoreResult<()> {
+        let target = comparable_path(locator.as_str());
+        if self
+            .project
+            .images()
+            .iter()
+            .any(|image| comparable_path(image.locator.as_str()) == target)
+        {
+            return Err(CoreError::WouldOverwriteSource(locator.display_name()));
+        }
+        Ok(())
     }
 
     fn invalidate_result(&mut self) {
@@ -1016,6 +1071,25 @@ fn rotated_crop_image(
         Arc::new(fitted.rotated(rotation))
     };
     (image, source_width, source_height)
+}
+
+/// Lexically normalized, case-folded path used to detect that two locators
+/// name the same file. Case folding errs toward refusing a write on
+/// case-insensitive file systems such as the macOS default.
+fn comparable_path(raw: &str) -> String {
+    let mut normalized = PathBuf::new();
+    for component in Path::new(raw).components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !normalized.pop() {
+                    normalized.push("..");
+                }
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    normalized.to_string_lossy().to_lowercase()
 }
 
 fn export_stem(locator: &ImageLocator, fallback: u64) -> String {
@@ -1448,6 +1522,177 @@ mod tests {
             assert!(workbench.edits(image.id).invert);
             assert!(workbench.edits(image.id).crop.is_none());
         }
+    }
+
+    #[test]
+    fn batch_edits_keep_each_existing_crop() {
+        let repo = repo_with(2);
+        let mut workbench = Workbench::new();
+        add(&mut workbench, &repo, 2);
+        let first = workbench.project().images()[0].id;
+        let second = workbench.project().images()[1].id;
+        let own_crop = CropRect {
+            x: 3,
+            y: 2,
+            width: 10,
+            height: 8,
+        };
+        workbench.update_edits(
+            second,
+            EditSettings {
+                crop: Some(own_crop),
+                ..EditSettings::default()
+            },
+        );
+        workbench.apply_edits_to_all(EditSettings {
+            invert: true,
+            crop: Some(CropRect {
+                x: 0,
+                y: 0,
+                width: 5,
+                height: 5,
+            }),
+            ..EditSettings::default()
+        });
+        assert!(workbench.edits(first).invert);
+        assert_eq!(workbench.edits(first).crop, None);
+        assert!(workbench.edits(second).invert);
+        assert_eq!(workbench.edits(second).crop, Some(own_crop));
+    }
+
+    #[test]
+    fn changing_the_rotation_drops_the_crop() {
+        let repo = repo_with(1);
+        let mut workbench = Workbench::new();
+        add(&mut workbench, &repo, 1);
+        let crop = CropRect {
+            x: 2,
+            y: 2,
+            width: 20,
+            height: 10,
+        };
+        workbench.update_current_edits(EditSettings {
+            crop: Some(crop),
+            ..EditSettings::default()
+        });
+        workbench.update_current_edits(EditSettings {
+            invert: true,
+            crop: Some(crop),
+            ..EditSettings::default()
+        });
+        assert_eq!(workbench.current_edits().crop, Some(crop));
+        workbench.update_current_edits(EditSettings {
+            rotation: 90.0,
+            crop: Some(crop),
+            ..EditSettings::default()
+        });
+        assert_eq!(workbench.current_edits().crop, None);
+    }
+
+    #[test]
+    fn the_project_does_not_change_while_a_stitch_runs() {
+        let repo = repo_with(3);
+        let mut workbench = Workbench::new();
+        add(&mut workbench, &repo, 2);
+        let first = workbench.project().images()[0].id;
+        let job = workbench.begin_stitch().unwrap();
+        let service = ProjectService::new(repo.clone());
+
+        assert_eq!(
+            workbench.add_images(&service, &[ImageLocator::new("image-2.png")]),
+            Err(CoreError::Busy)
+        );
+        assert_eq!(workbench.remove_image(first), Err(CoreError::Busy));
+        assert_eq!(workbench.move_down(first), Err(CoreError::Busy));
+        workbench.clear();
+        let options = StitchOptions {
+            min_inliers: 40,
+            ..StitchOptions::default()
+        };
+        workbench.update_options(options.clone());
+        assert!(workbench.is_busy(), "the running job must stay visible");
+        assert_eq!(workbench.project().len(), job.images.len());
+        assert_eq!(workbench.project().images()[0].id, first);
+        assert_ne!(workbench.options(), &options.sanitized());
+
+        workbench.fail_stitch("cancelled");
+        workbench.remove_image(first).unwrap();
+        assert_eq!(workbench.project().len(), 1);
+    }
+
+    #[test]
+    fn export_refuses_to_overwrite_a_source_image() {
+        let repo = repo_with(1);
+        let mut workbench = Workbench::new();
+        add(&mut workbench, &repo, 1);
+        let service = ProjectService::new(repo.clone());
+        for name in ["image-0.png", "./IMAGE-0.png", "other/../image-0.png"] {
+            assert!(
+                matches!(
+                    workbench.export(&service, &ImageLocator::new(name)),
+                    Err(CoreError::WouldOverwriteSource(_))
+                ),
+                "{name} was not refused"
+            );
+        }
+        assert!(repo.saved.lock().unwrap().is_empty());
+        workbench
+            .export(&service, &ImageLocator::new("image-0-edited.png"))
+            .unwrap();
+    }
+
+    #[test]
+    fn batch_export_gives_every_file_its_own_name_and_spares_sources() {
+        let repo = Arc::new(MemoryRepo::default());
+        for name in ["a/scan.png", "b/scan.png", "out/scan-edited.png"] {
+            repo.images.lock().unwrap().insert(
+                name.to_owned(),
+                LoadedImage {
+                    locator: ImageLocator::new(name),
+                    name: name.to_owned(),
+                    image: RgbaImage::filled(4, 4, [9, 9, 9, 255]),
+                    thumbnail: RgbaImage::filled(4, 4, [9, 9, 9, 255]),
+                    metadata: PhotoMetadata::default(),
+                    jpeg_quality: None,
+                },
+            );
+        }
+        let service = ProjectService::new(repo.clone());
+        let mut workbench = Workbench::new();
+        workbench
+            .add_images(
+                &service,
+                &[
+                    ImageLocator::new("a/scan.png"),
+                    ImageLocator::new("b/scan.png"),
+                ],
+            )
+            .unwrap();
+        workbench
+            .export_all(&service, Path::new("export"), "png")
+            .unwrap();
+        let saved: Vec<String> = repo
+            .saved
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(name, _)| name.clone())
+            .collect();
+        assert_eq!(saved.len(), 2);
+        assert_ne!(saved[0], saved[1], "two exports share one file");
+
+        workbench
+            .add_images(&service, &[ImageLocator::new("out/scan-edited.png")])
+            .unwrap();
+        repo.saved.lock().unwrap().clear();
+        assert!(matches!(
+            workbench.export_all(&service, Path::new("out"), "png"),
+            Err(CoreError::WouldOverwriteSource(_))
+        ));
+        assert!(
+            repo.saved.lock().unwrap().is_empty(),
+            "a refused batch must not write a partial set"
+        );
     }
 
     fn repo_with_jpeg_qualities(qualities: &[Option<u8>]) -> Arc<MemoryRepo> {

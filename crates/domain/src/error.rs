@@ -52,4 +52,10 @@ pub enum CoreError {
 
     #[error("not enough overlap between '{0}' and the already registered images")]
     NotEnoughOverlap(String),
+
+    #[error("a stitch operation is running; wait until it finishes")]
+    Busy,
+
+    #[error("'{0}' is a source image; choose another name so the original stays unmodified")]
+    WouldOverwriteSource(String),
 }
