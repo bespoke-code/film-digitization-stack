@@ -97,6 +97,7 @@ impl FocusMap {
     }
 
     /// Score of the tile containing the given pixel coordinate.
+    #[inline]
     pub fn at(&self, x: f64, y: f64, width: u32, height: u32) -> f64 {
         if width == 0 || height == 0 || !x.is_finite() || !y.is_finite() {
             return 0.0;

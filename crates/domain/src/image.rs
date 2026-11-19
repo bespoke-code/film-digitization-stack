@@ -4,6 +4,8 @@
 //! preview, compositing) agrees on pixel layout without the domain depending on
 //! a codec or graphics crate.
 
+use rayon::prelude::*;
+
 use crate::error::{CoreError, CoreResult};
 
 /// 8-bit RGBA image with straight (non-premultiplied) alpha.
@@ -62,6 +64,27 @@ impl RgbaImage {
         }
     }
 
+    /// Like [`Self::from_fn`], with rows filled on parallel workers. Used by
+    /// the full-resolution resampling paths, which are otherwise bound to one
+    /// core.
+    fn from_fn_parallel(width: u32, height: u32, f: impl Fn(u32, u32) -> [u8; 4] + Sync) -> Self {
+        let row_bytes = width as usize * 4;
+        let mut pixels = vec![0u8; row_bytes * height as usize];
+        pixels
+            .par_chunks_mut(row_bytes.max(1))
+            .enumerate()
+            .for_each(|(y, row)| {
+                for (x, pixel) in row.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+                    *pixel = f(x as u32, y as u32);
+                }
+            });
+        Self {
+            width,
+            height,
+            pixels,
+        }
+    }
+
     pub const fn width(&self) -> u32 {
         self.width
     }
@@ -82,6 +105,7 @@ impl RgbaImage {
         self.pixels
     }
 
+    #[inline]
     pub fn pixel(&self, x: u32, y: u32) -> [u8; 4] {
         let i = (y as usize * self.width as usize + x as usize) * 4;
         [
@@ -114,6 +138,7 @@ impl RgbaImage {
     }
 
     /// Bilinearly samples the image. Coordinates outside the image return `None`.
+    #[inline]
     pub fn sample_bilinear(&self, x: f64, y: f64) -> Option<[u8; 4]> {
         if !x.is_finite() || !y.is_finite() || x < 0.0 || y < 0.0 {
             return None;
@@ -132,10 +157,14 @@ impl RgbaImage {
         let fx = x - x0 as f64;
         let fy = y - y0 as f64;
 
-        let p00 = self.pixel(x0, y0);
-        let p10 = self.pixel(x1, y0);
-        let p01 = self.pixel(x0, y1);
-        let p11 = self.pixel(x1, y1);
+        let stride = self.width as usize * 4;
+        let row0 = &self.pixels[y0 as usize * stride..][..stride];
+        let row1 = &self.pixels[y1 as usize * stride..][..stride];
+        let (i0, i1) = (x0 as usize * 4, x1 as usize * 4);
+        let p00 = &row0[i0..i0 + 4];
+        let p10 = &row0[i1..i1 + 4];
+        let p01 = &row1[i0..i0 + 4];
+        let p11 = &row1[i1..i1 + 4];
         let mut out = [0u8; 4];
         for c in 0..4 {
             let top = p00[c] as f64 * (1.0 - fx) + p10[c] as f64 * fx;
@@ -152,7 +181,7 @@ impl RgbaImage {
         }
         let sx = self.width as f64 / width.max(1) as f64;
         let sy = self.height as f64 / height.max(1) as f64;
-        Self::from_fn(width, height, |x, y| {
+        Self::from_fn_parallel(width, height, |x, y| {
             let src_x = (x as f64 + 0.5) * sx - 0.5;
             let src_y = (y as f64 + 0.5) * sy - 0.5;
             self.sample_bilinear(
@@ -200,7 +229,7 @@ impl RgbaImage {
         let center_x = (self.width.saturating_sub(1)) as f64 / 2.0;
         let center_y = (self.height.saturating_sub(1)) as f64 / 2.0;
 
-        Self::from_fn(width, height, |x, y| {
+        Self::from_fn_parallel(width, height, |x, y| {
             let rx = x as f64 + min_x;
             let ry = y as f64 + min_y;
             let sx = center_x + cos * rx + sin * ry;
@@ -214,7 +243,7 @@ impl RgbaImage {
             1 | 3 => (self.height, self.width),
             _ => (self.width, self.height),
         };
-        Self::from_fn(width, height, |x, y| match quarter % 4 {
+        Self::from_fn_parallel(width, height, |x, y| match quarter % 4 {
             1 => self.pixel(y, self.height - 1 - x),
             2 => self.pixel(self.width - 1 - x, self.height - 1 - y),
             3 => self.pixel(self.width - 1 - y, x),
