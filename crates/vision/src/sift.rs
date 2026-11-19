@@ -270,77 +270,81 @@ fn build_scale_space(image: &GrayImage, config: &SiftConfig) -> Vec<Octave> {
 fn detect_and_describe(image: &GrayImage, config: &SiftConfig) -> FeatureSet {
     let octaves = build_scale_space(image, config);
     let mut features = Vec::new();
-    let s = config.scales_per_octave;
 
     for octave in &octaves {
-        let scale_factor = (1usize << octave.octave) as f32;
-        for layer in 1..=s {
-            let below = &octave.dog[layer - 1];
-            let current = &octave.dog[layer];
-            let above = &octave.dog[layer + 1];
-            let width = current.width;
-            let height = current.height;
-
-            for y in 1..height.saturating_sub(1) {
-                for x in 1..width.saturating_sub(1) {
-                    let center = current.at(x, y);
-                    if center.abs() < config.contrast_threshold {
-                        continue;
-                    }
-                    if !is_extremum(below, current, above, x, y, center) {
-                        continue;
-                    }
-                    if is_edge_response(current, x, y, config.edge_threshold) {
-                        continue;
-                    }
-
-                    let Some((rx, ry, rlayer)) =
-                        refine_extremum(octave, layer, x, y, config.contrast_threshold)
-                    else {
-                        continue;
-                    };
-
-                    let local_sigma = config.sigma * 2.0f32.powf(rlayer / s as f32);
-                    let gaussian_index =
-                        (rlayer.round() as usize).clamp(1, octave.gaussian.len().saturating_sub(1));
-                    let plane = &octave.gaussian[gaussian_index];
-                    let xi = rx.round() as i32;
-                    let yi = ry.round() as i32;
-                    if xi <= 0
-                        || yi <= 0
-                        || xi >= plane.width as i32 - 1
-                        || yi >= plane.height as i32 - 1
-                    {
-                        continue;
-                    }
-
-                    let responses = orientation_histogram(plane, xi, yi, local_sigma);
-                    for orientation in responses {
-                        let Some(descriptor) = describe(plane, xi, yi, local_sigma, orientation)
-                        else {
-                            continue;
-                        };
-                        // Each 2x2 average moves pixel centres by half a
-                        // pixel, so map through centres, not corners.
-                        features.push(Feature {
-                            keypoint: Keypoint {
-                                x: (rx + 0.5) * scale_factor - 0.5,
-                                y: (ry + 0.5) * scale_factor - 0.5,
-                                scale: local_sigma * scale_factor,
-                                orientation,
-                                response: center.abs(),
-                            },
-                            descriptor,
-                        });
-                    }
-                }
-            }
+        for layer in 1..=config.scales_per_octave {
+            let height = octave.dog[layer].height;
+            // Rows are independent, so they run in parallel. Collecting in
+            // row order keeps the feature list identical to a serial scan.
+            let rows: Vec<Vec<Feature>> = (1..height.saturating_sub(1))
+                .into_par_iter()
+                .map(|y| detect_row(octave, layer, y, config))
+                .collect();
+            features.extend(rows.into_iter().flatten());
         }
     }
 
     features.sort_by(|a, b| b.keypoint.response.total_cmp(&a.keypoint.response));
     features.truncate(config.max_features);
     FeatureSet::new(features)
+}
+
+/// Finds, refines and describes the scale-space extrema of one DoG row.
+fn detect_row(octave: &Octave, layer: usize, y: usize, config: &SiftConfig) -> Vec<Feature> {
+    let s = config.scales_per_octave;
+    let scale_factor = (1usize << octave.octave) as f32;
+    let below = &octave.dog[layer - 1];
+    let current = &octave.dog[layer];
+    let above = &octave.dog[layer + 1];
+    let mut features = Vec::new();
+
+    for x in 1..current.width.saturating_sub(1) {
+        let center = current.at(x, y);
+        if center.abs() < config.contrast_threshold {
+            continue;
+        }
+        if !is_extremum(below, current, above, x, y, center) {
+            continue;
+        }
+        if is_edge_response(current, x, y, config.edge_threshold) {
+            continue;
+        }
+
+        let Some((rx, ry, rlayer)) =
+            refine_extremum(octave, layer, x, y, config.contrast_threshold)
+        else {
+            continue;
+        };
+
+        let local_sigma = config.sigma * 2.0f32.powf(rlayer / s as f32);
+        let gaussian_index =
+            (rlayer.round() as usize).clamp(1, octave.gaussian.len().saturating_sub(1));
+        let plane = &octave.gaussian[gaussian_index];
+        let xi = rx.round() as i32;
+        let yi = ry.round() as i32;
+        if xi <= 0 || yi <= 0 || xi >= plane.width as i32 - 1 || yi >= plane.height as i32 - 1 {
+            continue;
+        }
+
+        for orientation in orientation_histogram(plane, xi, yi, local_sigma) {
+            let Some(descriptor) = describe(plane, xi, yi, local_sigma, orientation) else {
+                continue;
+            };
+            // Each 2x2 average moves pixel centres by half a pixel, so map
+            // through centres, not corners.
+            features.push(Feature {
+                keypoint: Keypoint {
+                    x: (rx + 0.5) * scale_factor - 0.5,
+                    y: (ry + 0.5) * scale_factor - 0.5,
+                    scale: local_sigma * scale_factor,
+                    orientation,
+                    response: center.abs(),
+                },
+                descriptor,
+            });
+        }
+    }
+    features
 }
 
 #[inline]
@@ -729,6 +733,24 @@ mod tests {
         let a = extractor.extract(&gray).unwrap();
         let b = extractor.extract(&gray).unwrap();
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn parallel_extraction_matches_a_single_thread() {
+        let gray = texture(320, 240, 19).to_gray();
+        let extractor = SiftExtractor::default();
+        let serial = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap()
+            .install(|| extractor.extract(&gray).unwrap());
+        let parallel = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap()
+            .install(|| extractor.extract(&gray).unwrap());
+        assert!(serial.len() > 50, "only {} features", serial.len());
+        assert_eq!(serial, parallel);
     }
 
     #[test]
