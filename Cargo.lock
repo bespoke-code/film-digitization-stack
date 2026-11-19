@@ -3086,7 +3086,6 @@ name = "stitch-imaging"
 version = "0.1.0"
 dependencies = [
  "image",
- "log",
  "rayon",
  "stitch-domain",
  "tempfile",
@@ -3108,7 +3107,6 @@ name = "stitch-testkit"
 version = "0.1.0"
 dependencies = [
  "nalgebra",
- "stitch-application",
  "stitch-domain",
  "tempfile",
 ]
@@ -3143,7 +3141,6 @@ dependencies = [
 name = "stitch-vision"
 version = "0.1.0"
 dependencies = [
- "log",
  "nalgebra",
  "rayon",
  "stitch-domain",

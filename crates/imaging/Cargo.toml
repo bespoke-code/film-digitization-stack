@@ -10,7 +10,6 @@ description = "Filesystem image repository and CPU compositor adapters"
 stitch-domain.workspace = true
 image.workspace = true
 rayon.workspace = true
-log.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
