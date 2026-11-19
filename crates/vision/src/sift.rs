@@ -548,6 +548,30 @@ fn orientation_histogram(plane: &Plane, x: i32, y: i32, sigma: f32) -> Vec<f32> 
 }
 
 fn describe(plane: &Plane, x: i32, y: i32, sigma: f32, orientation: f32) -> Option<Descriptor> {
+    let histogram = descriptor_histogram(plane, x, y, sigma, orientation)?;
+    let mut descriptor = Descriptor::from_array(histogram);
+    if descriptor.normalize() <= f32::EPSILON {
+        return None;
+    }
+    for value in &mut descriptor.values {
+        *value = value.min(0.2);
+    }
+    descriptor.normalize();
+    Some(descriptor)
+}
+
+/// Accumulates the 4x4x8 gradient histogram before normalization.
+///
+/// Lowe weights every sample with a Gaussian whose sigma is half the
+/// descriptor width. Gradients far from the keypoint are the most affected by
+/// small registration errors, so the window keeps them from dominating.
+fn descriptor_histogram(
+    plane: &Plane,
+    x: i32,
+    y: i32,
+    sigma: f32,
+    orientation: f32,
+) -> Option<[f32; 128]> {
     let bins = 4usize;
     let orientation_bins = 8usize;
     let hist_width = 3.0 * sigma;
@@ -557,6 +581,8 @@ fn describe(plane: &Plane, x: i32, y: i32, sigma: f32, orientation: f32) -> Opti
     }
     let cos = orientation.cos();
     let sin = orientation.sin();
+    let window_sigma = bins as f32 * 0.5;
+    let window_scale = -1.0 / (2.0 * window_sigma * window_sigma);
     let mut histogram = [0.0f32; 128];
 
     for dy in -radius..=radius {
@@ -582,7 +608,9 @@ fn describe(plane: &Plane, x: i32, y: i32, sigma: f32, orientation: f32) -> Opti
                 plane.at((px + 1) as usize, py as usize) - plane.at((px - 1) as usize, py as usize);
             let gy =
                 plane.at(px as usize, (py + 1) as usize) - plane.at(px as usize, (py - 1) as usize);
-            let magnitude = (gx * gx + gy * gy).sqrt();
+            let window =
+                ((rotated_col * rotated_col + rotated_row * rotated_row) * window_scale).exp();
+            let magnitude = (gx * gx + gy * gy).sqrt() * window;
             if magnitude <= 0.0 {
                 continue;
             }
@@ -623,15 +651,7 @@ fn describe(plane: &Plane, x: i32, y: i32, sigma: f32, orientation: f32) -> Opti
         }
     }
 
-    let mut descriptor = Descriptor::from_array(histogram);
-    if descriptor.normalize() <= f32::EPSILON {
-        return None;
-    }
-    for value in &mut descriptor.values {
-        *value = value.min(0.2);
-    }
-    descriptor.normalize();
-    Some(descriptor)
+    Some(histogram)
 }
 
 #[cfg(test)]
@@ -802,6 +822,35 @@ mod tests {
                 feature.keypoint.y
             );
         }
+    }
+
+    #[test]
+    fn descriptor_window_favours_gradients_near_the_keypoint() {
+        // A uniform gradient gives every sample the same magnitude, so the
+        // cell totals show the weight of the window alone.
+        let plane = Plane {
+            width: 96,
+            height: 96,
+            data: (0..96 * 96)
+                .map(|index| 0.2 + 0.005 * (index % 96) as f32)
+                .collect(),
+        };
+        let histogram = descriptor_histogram(&plane, 48, 48, 4.0, 0.0).unwrap();
+        let cell = |row: usize, column: usize| -> f32 {
+            histogram[(row * 4 + column) * 8..(row * 4 + column + 1) * 8]
+                .iter()
+                .sum()
+        };
+        let centre = (cell(1, 1) + cell(1, 2) + cell(2, 1) + cell(2, 2)) / 4.0;
+        let corner = (cell(0, 0) + cell(0, 3) + cell(3, 0) + cell(3, 3)) / 4.0;
+        let ratio = corner / centre;
+        // Without a window the ratio is 1. Cell centres sit 0.5 and 1.5 bins
+        // from the keypoint on each axis, so a window with a sigma of two
+        // bins gives about exp(-0.5).
+        assert!(
+            (0.55..0.68).contains(&ratio),
+            "corner/centre weight ratio was {ratio:.3}"
+        );
     }
 
     #[test]
