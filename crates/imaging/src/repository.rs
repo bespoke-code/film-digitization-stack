@@ -4,7 +4,11 @@ use std::io::{Cursor, Write};
 use std::path::{Path, PathBuf};
 
 use image::codecs::jpeg::JpegEncoder;
-use image::{DynamicImage, ExtendedColorType, ImageFormat, RgbaImage as ImageRgbaImage};
+use image::metadata::Orientation;
+use image::{
+    DynamicImage, ExtendedColorType, ImageDecoder, ImageFormat, ImageReader,
+    RgbaImage as ImageRgbaImage,
+};
 use stitch_domain::{
     CoreError, CoreResult, ImageLocator, ImageRepository, LoadedImage, PhotoMetadata, RgbaImage,
     SaveOptions,
@@ -64,10 +68,24 @@ impl ImageRepository for FileImageRepository {
             path: locator.as_str().to_owned(),
             message: error.to_string(),
         })?;
-        let decoded = image::load_from_memory(&bytes).map_err(|error| CoreError::Decode {
+        let decode_error = |error: image::ImageError| CoreError::Decode {
             name: locator.display_name(),
             message: error.to_string(),
-        })?;
+        };
+        let mut decoder = ImageReader::new(Cursor::new(&bytes))
+            .with_guessed_format()
+            .map_err(|error| CoreError::Io {
+                path: locator.as_str().to_owned(),
+                message: error.to_string(),
+            })?
+            .into_decoder()
+            .map_err(decode_error)?;
+        // Cameras store portrait shots sideways and record the turn in EXIF.
+        // Applying it here means every later step sees the upright photo, and
+        // exports, which carry no orientation tag, stay upright too.
+        let orientation = decoder.orientation().unwrap_or(Orientation::NoTransforms);
+        let mut decoded = DynamicImage::from_decoder(decoder).map_err(decode_error)?;
+        decoded.apply_orientation(orientation);
         let metadata = extract_metadata(&bytes);
         let jpeg_quality = jpeg_quality(&bytes);
         let mut rgba = decoded.to_rgba8();
@@ -330,6 +348,63 @@ mod tests {
 
         let bytes = std::fs::read(&path).unwrap();
         assert_eq!(jpeg_quality(&bytes), Some(96));
+    }
+
+    /// Inserts an APP1 segment whose EXIF holds only an orientation tag.
+    fn with_exif_orientation(jpeg: &[u8], orientation: u16) -> Vec<u8> {
+        let mut tiff = Vec::new();
+        tiff.extend_from_slice(b"II");
+        tiff.extend_from_slice(&42u16.to_le_bytes());
+        tiff.extend_from_slice(&8u32.to_le_bytes());
+        tiff.extend_from_slice(&1u16.to_le_bytes());
+        tiff.extend_from_slice(&0x0112u16.to_le_bytes());
+        tiff.extend_from_slice(&3u16.to_le_bytes());
+        tiff.extend_from_slice(&1u32.to_le_bytes());
+        tiff.extend_from_slice(&orientation.to_le_bytes());
+        tiff.extend_from_slice(&[0, 0]);
+        tiff.extend_from_slice(&0u32.to_le_bytes());
+        let mut out = jpeg[..2].to_vec();
+        out.extend_from_slice(&[0xFF, 0xE1]);
+        out.extend_from_slice(&((2 + 6 + tiff.len()) as u16).to_be_bytes());
+        out.extend_from_slice(b"Exif\0\0");
+        out.extend_from_slice(&tiff);
+        out.extend_from_slice(&jpeg[2..]);
+        out
+    }
+
+    #[test]
+    fn load_applies_the_exif_orientation() {
+        // Left half dark, right half bright, stored sideways with
+        // orientation 6: the viewer must turn it 90 degrees clockwise, which
+        // moves the left half to the top.
+        let rgb = image::RgbImage::from_fn(32, 16, |x, _| {
+            if x < 16 {
+                image::Rgb([10, 10, 10])
+            } else {
+                image::Rgb([240, 240, 240])
+            }
+        });
+        let mut jpeg = Vec::new();
+        JpegEncoder::new_with_quality(&mut jpeg, 95)
+            .encode(rgb.as_raw(), 32, 16, ExtendedColorType::Rgb8)
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("portrait.jpg");
+        std::fs::write(&path, with_exif_orientation(&jpeg, 6)).unwrap();
+
+        let loaded = FileImageRepository::default()
+            .load(&ImageLocator::new(path.to_string_lossy()))
+            .unwrap();
+        assert_eq!((loaded.image.width(), loaded.image.height()), (16, 32));
+        assert!(
+            loaded.image.pixel(8, 4)[0] < 60,
+            "top must be the dark half"
+        );
+        assert!(loaded.image.pixel(8, 28)[0] > 200, "bottom must be bright");
+        assert!(
+            loaded.thumbnail.width() < loaded.thumbnail.height(),
+            "the thumbnail must be upright too"
+        );
     }
 
     #[test]
