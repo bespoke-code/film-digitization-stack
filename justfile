@@ -122,7 +122,7 @@ package-macos:
     just build
     version="{{ version }}"
     arch="$(uname -m)"
-    app="dist/macos/Scan to image.app"
+    app="dist/macos/Scan to Image.app"
     rm -rf "dist/macos"
     mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
     cp target/release/scan-to-img "$app/Contents/MacOS/scan-to-img"
@@ -137,7 +137,7 @@ package-macos:
     mkdir -p "$staging"
     cp -R "$app" "$staging/"
     ln -s /Applications "$staging/Applications"
-    hdiutil create -volname "Scan to image" -srcfolder "$staging" -ov -format UDZO "dist/scan-to-img-${version}-macos-${arch}.dmg"
+    hdiutil create -volname "Scan to Image" -srcfolder "$staging" -ov -format UDZO "dist/scan-to-img-${version}-macos-${arch}.dmg"
     ditto -c -k --keepParent "$app" "dist/scan-to-img-${version}-macos-${arch}.zip"
 
 # Build a portable archive with the raw binary.
@@ -183,8 +183,8 @@ install prefix="":
     prefix="${1:-${PREFIX:-$HOME/.local}}"
     case "$(uname -s)" in
         Darwin)
-            app="$HOME/Applications/Scan to image.app"
-            rm -rf "$app"
+            app="$HOME/Applications/Scan to Image.app"
+            rm -rf "$app" "$HOME/Applications/Scan to image.app"
             mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources" "$prefix/bin"
             cp target/release/scan-to-img "$app/Contents/MacOS/scan-to-img"
             sed "s|@VERSION@|{{ version }}|g" packaging/macos/Info.plist.in > "$app/Contents/Info.plist"
@@ -218,7 +218,7 @@ uninstall prefix="":
     prefix="${1:-${PREFIX:-$HOME/.local}}"
     case "$(uname -s)" in
         Darwin)
-            rm -rf "$HOME/Applications/Scan to image.app"
+            rm -rf "$HOME/Applications/Scan to Image.app" "$HOME/Applications/Scan to image.app"
             rm -f "$prefix/bin/scan-to-img"
             ;;
         Linux)

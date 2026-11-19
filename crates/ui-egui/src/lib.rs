@@ -5,6 +5,11 @@
 //! [`stitch_renderer_wgpu::PreviewRenderer`] inside an egui-wgpu paint callback.
 
 mod dialog;
+#[cfg(target_os = "macos")]
+mod menu;
+#[cfg(target_os = "macos")]
+mod native;
+mod style;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -12,8 +17,8 @@ use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread::JoinHandle;
 
 use dialog::{
-    folder_has_raw_images, images_in_folder, is_raw_image, is_supported_image, DialogMode,
-    DialogOutcome, FileDialog,
+    folder_has_raw_images, images_in_folder, is_raw_image, is_supported_image,
+    with_format_extension, DialogMode, DialogOutcome, FileDialog, SaveFormat,
 };
 use eframe::egui;
 use stitch_application::{ProjectService, StitchService};
@@ -24,6 +29,138 @@ use stitch_domain::{
 };
 use stitch_renderer_wgpu::PreviewRenderer;
 use stitch_ui_core::{PreviewTarget, Workbench, WorkbenchStatus};
+
+/// A user intent shared by the menu bar, keyboard shortcuts and buttons.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Command {
+    AddImages,
+    OpenFolder,
+    Export,
+    ExportAll,
+    ClearProject,
+    Quit,
+    Stitch,
+    RoughArrange,
+    MoveUp,
+    MoveDown,
+    RemoveImage,
+    LevelsAndCurves,
+    Crop,
+    ShowOriginal,
+    ShowPanorama,
+    ZoomIn,
+    ZoomOut,
+    ZoomToFit,
+}
+
+impl Command {
+    const ALL: [Self; 18] = [
+        Self::AddImages,
+        Self::OpenFolder,
+        Self::Export,
+        Self::ExportAll,
+        Self::ClearProject,
+        Self::Quit,
+        Self::Stitch,
+        Self::RoughArrange,
+        Self::MoveUp,
+        Self::MoveDown,
+        Self::RemoveImage,
+        Self::LevelsAndCurves,
+        Self::Crop,
+        Self::ShowOriginal,
+        Self::ShowPanorama,
+        Self::ZoomIn,
+        Self::ZoomOut,
+        Self::ZoomToFit,
+    ];
+
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub(crate) fn id(self) -> &'static str {
+        match self {
+            Self::AddImages => "add-images",
+            Self::OpenFolder => "open-folder",
+            Self::Export => "export",
+            Self::ExportAll => "export-all",
+            Self::ClearProject => "clear-project",
+            Self::Quit => "quit",
+            Self::Stitch => "stitch",
+            Self::RoughArrange => "rough-arrange",
+            Self::MoveUp => "move-up",
+            Self::MoveDown => "move-down",
+            Self::RemoveImage => "remove-image",
+            Self::LevelsAndCurves => "levels-and-curves",
+            Self::Crop => "crop",
+            Self::ShowOriginal => "show-original",
+            Self::ShowPanorama => "show-panorama",
+            Self::ZoomIn => "zoom-in",
+            Self::ZoomOut => "zoom-out",
+            Self::ZoomToFit => "zoom-to-fit",
+        }
+    }
+
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub(crate) fn from_id(id: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|command| command.id() == id)
+    }
+
+    /// Title-case labels with an ellipsis when another step follows, as the
+    /// macOS Human Interface Guidelines ask for.
+    pub(crate) fn menu_title(self) -> &'static str {
+        match self {
+            Self::AddImages => "Add Images…",
+            Self::OpenFolder => "Open Folder…",
+            Self::Export => "Export…",
+            Self::ExportAll => "Export All…",
+            Self::ClearProject => "Clear Project",
+            Self::Quit => "Quit Scan to Image",
+            Self::Stitch => "Stitch Panorama",
+            Self::RoughArrange => "Rough Arrange…",
+            Self::MoveUp => "Move Up",
+            Self::MoveDown => "Move Down",
+            Self::RemoveImage => "Remove Image",
+            Self::LevelsAndCurves => "Levels & Curves…",
+            Self::Crop => "Crop",
+            Self::ShowOriginal => "Show Original",
+            Self::ShowPanorama => "Show Panorama",
+            Self::ZoomIn => "Zoom In",
+            Self::ZoomOut => "Zoom Out",
+            Self::ZoomToFit => "Zoom to Fit",
+        }
+    }
+
+    /// Command-key shortcut (Control on Linux) plus any Shift or Option.
+    pub(crate) fn shortcut(self) -> Option<(egui::Modifiers, egui::Key)> {
+        use egui::{Key, Modifiers};
+        let plain = Modifiers::NONE;
+        let shift = Modifiers::SHIFT;
+        let alt = Modifiers::ALT;
+        Some(match self {
+            Self::AddImages => (plain, Key::O),
+            Self::OpenFolder => (shift, Key::O),
+            Self::Export => (plain, Key::E),
+            Self::ExportAll => (shift, Key::E),
+            Self::Quit => (plain, Key::Q),
+            Self::Stitch => (plain, Key::R),
+            Self::RoughArrange => (shift, Key::R),
+            Self::MoveUp => (alt, Key::ArrowUp),
+            Self::MoveDown => (alt, Key::ArrowDown),
+            Self::RemoveImage => (plain, Key::Backspace),
+            Self::LevelsAndCurves => (plain, Key::L),
+            Self::Crop => (plain, Key::K),
+            Self::ZoomIn => (plain, Key::Equals),
+            Self::ZoomOut => (plain, Key::Minus),
+            Self::ZoomToFit => (plain, Key::Num9),
+            Self::ClearProject | Self::ShowOriginal | Self::ShowPanorama => return None,
+        })
+    }
+
+    /// Commands that act on the image list must not fire while a text field
+    /// is being edited, where the same keys edit text.
+    fn conflicts_with_text(self) -> bool {
+        matches!(self, Self::RemoveImage | Self::MoveUp | Self::MoveDown)
+    }
+}
 
 enum WorkerEvent {
     Progress(StitchProgress),
@@ -223,6 +360,8 @@ struct ArrangeState {
     items: Vec<ArrangeItem>,
     scale: f32,
     view_zoom: f32,
+    /// Scroll offset to apply on the next frame, set by a pinch.
+    scroll_to: Option<egui::Vec2>,
     scene: egui::Rect,
     drag: Option<usize>,
     selected: Option<usize>,
@@ -301,6 +440,10 @@ pub struct ScanToImgApp {
     crop_drag: Option<CropDrag>,
     arrange_open: bool,
     arrange: Option<ArrangeState>,
+    export_format: SaveFormat,
+    export_quality: Option<u8>,
+    #[cfg(target_os = "macos")]
+    menu: Option<menu::MenuBar>,
 }
 
 impl ScanToImgApp {
@@ -319,6 +462,7 @@ impl ScanToImgApp {
             false
         };
 
+        style::apply(&cc.egui_ctx);
         let options = StitchOptions::default();
         Self {
             workbench: Workbench::new(),
@@ -340,7 +484,167 @@ impl ScanToImgApp {
             crop_drag: None,
             arrange_open: false,
             arrange: None,
+            export_format: SaveFormat::Png,
+            export_quality: None,
+            #[cfg(target_os = "macos")]
+            menu: menu::MenuBar::install(&cc.egui_ctx),
         }
+    }
+
+    fn can_run(&self, command: Command) -> bool {
+        let busy = self.workbench.is_busy();
+        let selected = self.workbench.selected().is_some();
+        let has_preview = self.workbench.has_preview();
+        match command {
+            Command::AddImages => self.workbench.can_add() && !busy,
+            Command::OpenFolder => !busy,
+            Command::Export => self.workbench.can_export(),
+            Command::ExportAll => !self.workbench.project().is_empty() && !busy,
+            Command::ClearProject => !self.workbench.project().is_empty() && !busy,
+            Command::Quit | Command::ZoomIn | Command::ZoomOut | Command::ZoomToFit => true,
+            Command::Stitch => self.workbench.can_stitch(),
+            Command::RoughArrange => self.workbench.project().len() > 1 && !busy,
+            Command::MoveUp | Command::MoveDown | Command::RemoveImage => selected && !busy,
+            Command::LevelsAndCurves | Command::Crop | Command::ShowOriginal => has_preview,
+            Command::ShowPanorama => self.workbench.result().is_some(),
+        }
+    }
+
+    fn run_command(&mut self, ctx: &egui::Context, command: Command) {
+        if !self.can_run(command)
+            || (command.conflicts_with_text() && ctx.egui_wants_keyboard_input())
+        {
+            return;
+        }
+        match command {
+            Command::AddImages => self.request_file(DialogMode::AddImages),
+            Command::OpenFolder => self.request_file(DialogMode::OpenFolder),
+            Command::Export => self.request_file(DialogMode::SaveImage),
+            Command::ExportAll => self.request_file(DialogMode::SaveFolder),
+            Command::ClearProject => {
+                self.workbench.clear();
+                self.thumbnails.clear();
+                self.arrange = None;
+                self.arrange_open = false;
+            }
+            Command::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+            Command::Stitch => self.start_stitch(ctx),
+            Command::RoughArrange => self.open_arrange(ctx),
+            Command::MoveUp | Command::MoveDown => {
+                if let Some(id) = self.workbench.selected() {
+                    let moved = if command == Command::MoveUp {
+                        self.workbench.move_up(id)
+                    } else {
+                        self.workbench.move_down(id)
+                    };
+                    if moved.is_ok() {
+                        self.arrange = None;
+                        self.arrange_open = false;
+                    }
+                }
+            }
+            Command::RemoveImage => self.remove_selected(),
+            Command::LevelsAndCurves => self.tone_open = true,
+            Command::Crop => self.toggle_crop(),
+            Command::ShowOriginal => {
+                let show = self.workbench.show_edits();
+                self.workbench.set_show_edits(!show);
+            }
+            Command::ShowPanorama => {
+                let _ = self.workbench.show_stitched();
+                self.picking_film_base = false;
+            }
+            Command::ZoomIn => self.preview.zoom = (self.preview.zoom * 1.25).min(20.0),
+            Command::ZoomOut => self.preview.zoom = (self.preview.zoom / 1.25).max(0.1),
+            Command::ZoomToFit => {
+                self.preview.zoom = 1.0;
+                self.preview.pan = egui::Vec2::ZERO;
+            }
+        }
+    }
+
+    /// Commands chosen this frame. macOS delivers them through the menu bar,
+    /// which owns the key equivalents; elsewhere they come from shortcuts.
+    fn pending_commands(&mut self, ctx: &egui::Context) -> Vec<Command> {
+        #[cfg(target_os = "macos")]
+        if let Some(menu) = &self.menu {
+            return menu.take_commands();
+        }
+        if self.dialog_open() {
+            return Vec::new();
+        }
+        // Shortcuts with Shift or Option first, so Command-O does not also
+        // match Shift-Command-O.
+        let mut shortcuts: Vec<(Command, egui::KeyboardShortcut)> = Command::ALL
+            .into_iter()
+            .filter_map(|command| {
+                let (modifiers, key) = command.shortcut()?;
+                Some((
+                    command,
+                    egui::KeyboardShortcut::new(modifiers | egui::Modifiers::COMMAND, key),
+                ))
+            })
+            .collect();
+        shortcuts.sort_by_key(|(_, shortcut)| {
+            std::cmp::Reverse(shortcut.modifiers.shift as u8 + shortcut.modifiers.alt as u8)
+        });
+        ctx.input_mut(|input| {
+            shortcuts
+                .into_iter()
+                .filter(|(_, shortcut)| input.consume_shortcut(shortcut))
+                .map(|(command, _)| command)
+                .collect()
+        })
+    }
+
+    fn dialog_open(&self) -> bool {
+        self.dialog.is_open()
+    }
+
+    fn toggle_crop(&mut self) {
+        self.crop_mode = !self.crop_mode;
+        self.crop_drag = None;
+        self.picking_film_base = false;
+        self.crop_draft = if self.crop_mode {
+            let crop = self.workbench.current_edits().crop;
+            self.workbench.crop_preview().and_then(|preview| {
+                crop.map(|crop| {
+                    crop_to_normalized(crop, preview.source_width, preview.source_height)
+                })
+            })
+        } else {
+            None
+        };
+    }
+
+    /// Opens the Open or Save panel for `mode`: the system panel on macOS,
+    /// the matching in-app panel elsewhere.
+    fn request_file(&mut self, mode: DialogMode) {
+        let (start, filename) = match mode {
+            DialogMode::AddImages | DialogMode::OpenFolder => (None, String::new()),
+            DialogMode::SaveImage => (self.default_export_dir(), self.default_export_name()),
+            DialogMode::SaveFolder => (self.default_export_dir(), String::new()),
+        };
+        // SCAN_TO_IMG_BUILTIN_PANELS=1 shows the Linux panels on macOS, so
+        // both can be checked on one machine.
+        #[cfg(target_os = "macos")]
+        if std::env::var_os("SCAN_TO_IMG_BUILTIN_PANELS").is_none() {
+            if let Some(outcome) = native::run(mode, start, filename) {
+                self.handle_dialog_outcome(outcome);
+            }
+            return;
+        }
+        self.dialog.open_in(mode, start, filename);
+    }
+
+    fn jpeg_quality(&self, batch: bool) -> u8 {
+        self.export_quality.unwrap_or_else(|| {
+            if batch {
+                self.workbench.default_batch_jpeg_quality()
+            } else {
+                self.workbench.default_export_jpeg_quality()
+            }
+        })
     }
 
     fn poll_worker(&mut self) {
@@ -480,8 +784,12 @@ impl ScanToImgApp {
             .map(|stem| stem.to_string_lossy().into_owned())
             .unwrap_or_else(|| "panorama".to_owned());
         match self.workbench.preview_target() {
-            PreviewTarget::Stitched => format!("{stem}-stitched.png"),
-            PreviewTarget::Image(_) => format!("{stem}-edited.png"),
+            PreviewTarget::Stitched => {
+                with_format_extension(&format!("{stem}-stitched"), self.export_format)
+            }
+            PreviewTarget::Image(_) => {
+                with_format_extension(&format!("{stem}-edited"), self.export_format)
+            }
         }
     }
 
@@ -514,10 +822,16 @@ impl ScanToImgApp {
                     self.add_paths(images);
                 }
             }
-            DialogOutcome::SaveImage(path, quality) => {
+            DialogOutcome::SaveImage(mut path) => {
+                match SaveFormat::from_path(&path) {
+                    Some(format) => self.export_format = format,
+                    None => {
+                        path.set_extension(self.export_format.extension());
+                    }
+                }
                 let locator = ImageLocator::from(path.as_path());
                 let options = SaveOptions {
-                    jpeg_quality: quality,
+                    jpeg_quality: self.jpeg_quality(false),
                 };
                 match self
                     .workbench
@@ -529,14 +843,14 @@ impl ScanToImgApp {
                     Err(error) => self.workbench.fail_stitch(error.to_string()),
                 }
             }
-            DialogOutcome::SaveFolder(folder, format, quality) => {
+            DialogOutcome::SaveFolder(folder) => {
                 let options = SaveOptions {
-                    jpeg_quality: quality,
+                    jpeg_quality: self.jpeg_quality(true),
                 };
                 match self.workbench.export_all_with_options(
                     &self.project_service,
                     &folder,
-                    format.extension(),
+                    self.export_format.extension(),
                     &options,
                 ) {
                     Ok(count) => self.workbench.notify(format!(
@@ -568,171 +882,167 @@ impl ScanToImgApp {
         texture
     }
 
+    /// A unified toolbar: on macOS it shares the title bar with the window
+    /// controls and drags the window like a title bar does.
     fn toolbar(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
-        ui.horizontal_wrapped(|ui| {
-            ui.heading("Scan to image");
-            ui.separator();
+        let background = ui.interact(
+            ui.max_rect(),
+            ui.scope_id().with("toolbar-background"),
+            egui::Sense::click_and_drag(),
+        );
+        if cfg!(target_os = "macos") {
+            if background.drag_started() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+            }
+            if background.double_clicked() {
+                let maximized = ctx.input(|input| input.viewport().maximized.unwrap_or(false));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
+            }
+        }
 
-            let add_label = format!("Add images ({} left)", self.workbench.remaining_slots());
-            if ui
-                .add_enabled(
-                    self.workbench.can_add() && !self.workbench.is_busy(),
-                    egui::Button::new(add_label),
-                )
-                .clicked()
-            {
-                self.dialog.open_in(
-                    DialogMode::AddImages,
-                    None,
-                    String::new(),
-                    self.workbench.default_export_jpeg_quality(),
-                );
+        let mut chosen = None;
+        ui.horizontal_centered(|ui| {
+            if cfg!(target_os = "macos") {
+                ui.add_space(MACOS_WINDOW_CONTROLS_WIDTH);
             }
-            if ui
-                .add_enabled(!self.workbench.is_busy(), egui::Button::new("Open folder"))
-                .clicked()
-            {
-                self.dialog.open_in(
-                    DialogMode::OpenFolder,
-                    None,
-                    String::new(),
-                    self.workbench.default_export_jpeg_quality(),
-                );
-            }
-            if ui
-                .add_enabled(
-                    self.workbench.selected().is_some() && !self.workbench.is_busy(),
-                    egui::Button::new("Remove"),
-                )
-                .clicked()
-            {
-                self.remove_selected();
-            }
-            if ui
-                .add_enabled(
-                    self.workbench.selected().is_some() && !self.workbench.is_busy(),
-                    egui::Button::new("Move up"),
-                )
-                .clicked()
-            {
-                if let Some(id) = self.workbench.selected() {
-                    if self.workbench.move_up(id).is_ok() {
-                        self.arrange = None;
-                        self.arrange_open = false;
-                    }
-                }
-            }
-            if ui
-                .add_enabled(
-                    self.workbench.selected().is_some() && !self.workbench.is_busy(),
-                    egui::Button::new("Move down"),
-                )
-                .clicked()
-            {
-                if let Some(id) = self.workbench.selected() {
-                    if self.workbench.move_down(id).is_ok() {
-                        self.arrange = None;
-                        self.arrange_open = false;
-                    }
-                }
+            ui.label(egui::RichText::new("Scan to Image").strong());
+            ui.add_space(12.0);
+            for command in [Command::AddImages, Command::OpenFolder] {
+                chosen = chosen.or(self.toolbar_button(ui, command, false));
             }
             ui.separator();
-            if ui
-                .add_enabled(
-                    self.workbench.can_stitch(),
-                    egui::Button::new("Stitch panorama"),
-                )
-                .clicked()
-            {
-                self.start_stitch(ctx);
-            }
-            if ui
-                .add_enabled(
-                    self.workbench.project().len() > 1 && !self.workbench.is_busy(),
-                    egui::Button::new("Rough arrange…"),
-                )
-                .clicked()
-            {
-                self.open_arrange(ctx);
-            }
-            if ui
-                .add_enabled(self.workbench.can_export(), egui::Button::new("Export…"))
-                .clicked()
-            {
-                self.dialog.open_in(
-                    DialogMode::SaveImage,
-                    self.default_export_dir(),
-                    self.default_export_name(),
-                    self.workbench.default_export_jpeg_quality(),
-                );
-            }
-            if ui
-                .add_enabled(
-                    !self.workbench.project().is_empty() && !self.workbench.is_busy(),
-                    egui::Button::new("Export all…"),
-                )
-                .clicked()
-            {
-                self.dialog.open_in(
-                    DialogMode::SaveFolder,
-                    self.default_export_dir(),
-                    String::new(),
-                    self.workbench.default_batch_jpeg_quality(),
-                );
-            }
-            if ui.button("Clear").clicked() {
-                self.workbench.clear();
-                self.thumbnails.clear();
-                self.arrange = None;
-                self.arrange_open = false;
-            }
+            chosen = chosen.or(self.toolbar_button(ui, Command::Stitch, true));
+            chosen = chosen.or(self.toolbar_button(ui, Command::RoughArrange, false));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                for command in [Command::ExportAll, Command::Export] {
+                    chosen = chosen.or(self.toolbar_button(ui, command, false));
+                }
+            });
         });
+        if let Some(command) = chosen {
+            self.run_command(ctx, command);
+        }
     }
 
+    fn toolbar_button(
+        &self,
+        ui: &mut egui::Ui,
+        command: Command,
+        primary: bool,
+    ) -> Option<Command> {
+        let enabled = self.can_run(command);
+        let mut text = egui::RichText::new(command.menu_title());
+        if primary && enabled {
+            text = text.color(egui::Color32::WHITE);
+        }
+        let mut button = egui::Button::new(text);
+        if primary && enabled {
+            button = button.fill(ui.visuals().selection.bg_fill);
+        }
+        let mut response = ui.add_enabled(enabled, button);
+        if let Some((modifiers, key)) = command.shortcut() {
+            let shortcut = egui::KeyboardShortcut::new(modifiers | egui::Modifiers::COMMAND, key);
+            let hint = ui.ctx().format_shortcut(&shortcut);
+            response = response.on_hover_text(hint);
+        }
+        response.clicked().then_some(command)
+    }
+
+    /// A source list with the macOS add, remove and reorder buttons below it.
     fn image_list(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
-        ui.heading("Images");
-        ui.weak(format!(
-            "{} of {} selected",
-            self.workbench.project().len(),
-            stitch_domain::MAX_IMAGES
-        ));
-        ui.separator();
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Images").strong());
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.weak(format!(
+                    "{} of {}",
+                    self.workbench.project().len(),
+                    stitch_domain::MAX_IMAGES
+                ));
+            });
+        });
 
         let images = self.workbench.project().images().to_vec();
         let selected = self.workbench.selected();
+        let footer = 30.0;
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
+            .max_height((ui.available_height() - footer).max(60.0))
             .show(ui, |ui| {
                 if images.is_empty() {
-                    ui.label("Drop images here, or use Add images.");
+                    ui.add_space(24.0);
+                    ui.vertical_centered(|ui| {
+                        ui.weak("Drop images here, or choose File > Add Images.");
+                    });
                     return;
                 }
                 for image in &images {
                     let texture = self.thumbnail(ctx, image);
                     let is_selected = selected == Some(image.id);
-                    ui.horizontal(|ui| {
-                        let size = egui::vec2(56.0, 42.0);
-                        let scaled = fit_size(texture.size_vec2(), size);
-                        ui.image((texture.id(), scaled));
-                        ui.vertical(|ui| {
-                            if ui.selectable_label(is_selected, &image.name).clicked() {
-                                let _ = self.workbench.select_image(image.id);
-                                self.picking_film_base = false;
-                            }
-                            ui.weak(format!(
-                                "{} × {}",
-                                image.image.width(),
-                                image.image.height()
-                            ));
-                        });
-                    });
-                    ui.separator();
+                    if source_row(ui, &texture, image, is_selected).clicked() {
+                        let _ = self.workbench.select_image(image.id);
+                        self.picking_film_base = false;
+                    }
                 }
             });
+
+        ui.separator();
+        let mut chosen = None;
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 2.0;
+            for (command, symbol) in [
+                (Command::AddImages, "+"),
+                (Command::RemoveImage, "−"),
+                (Command::MoveUp, "↑"),
+                (Command::MoveDown, "↓"),
+            ] {
+                let button = egui::Button::new(symbol)
+                    .frame_when_inactive(false)
+                    .min_size(egui::vec2(24.0, 22.0));
+                if ui
+                    .add_enabled(self.can_run(command), button)
+                    .on_hover_text(command.menu_title())
+                    .clicked()
+                {
+                    chosen = Some(command);
+                }
+            }
+        });
+        if let Some(command) = chosen {
+            self.run_command(ctx, command);
+        }
+    }
+
+    fn export_settings(&mut self, ui: &mut egui::Ui) {
+        egui::Grid::new("export-settings")
+            .num_columns(2)
+            .spacing([8.0, 6.0])
+            .show(ui, |ui| {
+                ui.label("Export All format:");
+                egui::ComboBox::from_id_salt("export-format")
+                    .selected_text(self.export_format.label())
+                    .show_ui(ui, |ui| {
+                        for format in SaveFormat::ALL {
+                            ui.selectable_value(&mut self.export_format, format, format.label());
+                        }
+                    });
+                ui.end_row();
+                ui.label("JPEG quality:");
+                let mut quality = self.jpeg_quality(false);
+                if ui.add(egui::Slider::new(&mut quality, 1..=100)).changed() {
+                    self.export_quality = Some(quality);
+                }
+                ui.end_row();
+            });
+        ui.horizontal(|ui| {
+            if self.export_quality.is_some() && ui.button("Use Source Quality").clicked() {
+                self.export_quality = None;
+            }
+        });
+        ui.weak("JPEG quality starts at the quality of the source JPEG files.");
     }
 
     fn diagnostics(&self, ui: &mut egui::Ui) {
-        ui.heading("Diagnostics");
         match self.workbench.result() {
             Some(result) => {
                 let diagnostics = &result.diagnostics;
@@ -781,7 +1091,6 @@ impl ScanToImgApp {
     }
 
     fn settings(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Settings");
         ui.add(egui::Slider::new(&mut self.options.match_ratio, 0.5..=0.95).text("Match ratio"));
         ui.add(egui::Slider::new(&mut self.options.min_inliers, 6..=200).text("Minimum inliers"));
         ui.add(
@@ -823,7 +1132,7 @@ impl ScanToImgApp {
     }
 
     fn develop(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Develop");
+        ui.label(egui::RichText::new("Develop").strong());
         if !self.workbench.has_preview() {
             ui.weak("Select an image or stitch a panorama to edit it.");
             return;
@@ -916,7 +1225,7 @@ impl ScanToImgApp {
             )
             .changed();
 
-        if ui.button("Levels & curves…").clicked() {
+        if ui.button("Levels & Curves…").clicked() {
             self.tone_open = true;
         }
 
@@ -928,35 +1237,24 @@ impl ScanToImgApp {
         ui.horizontal(|ui| {
             if ui
                 .selectable_label(self.crop_mode, "Crop")
-                .on_hover_text("Adjust the crop on the preview, then press Apply")
+                .on_hover_text("Adjust the crop on the preview, then press Apply Crop")
                 .clicked()
             {
-                self.crop_mode = !self.crop_mode;
-                self.crop_drag = None;
-                self.picking_film_base = false;
-                self.crop_draft = if self.crop_mode {
-                    self.workbench.crop_preview().and_then(|preview| {
-                        edits.crop.map(|crop| {
-                            crop_to_normalized(crop, preview.source_width, preview.source_height)
-                        })
-                    })
-                } else {
-                    None
-                };
+                self.toggle_crop();
                 if self.crop_mode {
                     // Build the downscaled base before the first drag so the
                     // first click lands in an already responsive viewport.
                     let _ = self.workbench.crop_preview();
                 }
             }
-            if !self.crop_mode && edits.crop.is_some() && ui.button("Reset crop").clicked() {
+            if !self.crop_mode && edits.crop.is_some() && ui.button("Reset Crop").clicked() {
                 edits.crop = None;
                 changed = true;
             }
         });
         if self.crop_mode {
             ui.horizontal(|ui| {
-                if ui.button("Apply crop").clicked() {
+                if ui.button("Apply Crop").clicked() {
                     self.apply_crop(&mut edits);
                 }
                 if ui.button("Cancel").clicked() {
@@ -964,11 +1262,11 @@ impl ScanToImgApp {
                     self.crop_draft = None;
                     self.crop_drag = None;
                 }
-                if ui.button("Select all").clicked() {
+                if ui.button("Select All").clicked() {
                     self.crop_draft = Some(full_crop());
                 }
             });
-            ui.weak("Drag inside to move, drag a handle to resize, then Apply.");
+            ui.weak("Drag inside to move, drag a handle to resize, then Apply Crop.");
         }
         if let Some(crop) = edits.crop {
             ui.weak(format!(
@@ -984,7 +1282,7 @@ impl ScanToImgApp {
             if ui
                 .add_enabled(
                     self.workbench.project().len() > 1 || self.workbench.result().is_some(),
-                    egui::Button::new("Apply to all"),
+                    egui::Button::new("Apply to All"),
                 )
                 .on_hover_text("Copy tone and color settings to every photo and the panorama")
                 .clicked()
@@ -1017,7 +1315,6 @@ impl ScanToImgApp {
     }
 
     fn metadata(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Metadata");
         if !self.workbench.has_preview() {
             ui.weak("Select an image or stitch a panorama to add metadata.");
             return;
@@ -1055,7 +1352,7 @@ impl ScanToImgApp {
             if ui
                 .add_enabled(
                     self.workbench.project().len() > 1 || self.workbench.result().is_some(),
-                    egui::Button::new("Apply to all"),
+                    egui::Button::new("Apply to All"),
                 )
                 .on_hover_text("Copy these details to every photo and the panorama")
                 .clicked()
@@ -1146,6 +1443,7 @@ impl ScanToImgApp {
             items,
             scale,
             view_zoom: 1.0,
+            scroll_to: None,
             scene: egui::Rect::NOTHING,
             drag: None,
             selected: None,
@@ -1175,7 +1473,7 @@ impl ScanToImgApp {
         }
         let mut open = true;
         let mut action = ArrangeAction::default();
-        egui::Window::new("Rough arrange")
+        egui::Window::new("Rough Arrange")
             .open(&mut open)
             .default_size(egui::vec2(860.0, 620.0))
             .resizable(true)
@@ -1192,7 +1490,7 @@ impl ScanToImgApp {
                     if ui.button("Column").clicked() {
                         action.reset = Some(ArrangeLayout::Vertical);
                     }
-                    if ui.button("Apply and stitch").clicked() {
+                    if ui.button("Apply and Stitch").clicked() {
                         action.confirm = true;
                     }
                 });
@@ -1202,7 +1500,7 @@ impl ScanToImgApp {
                         state.reset_layout();
                     }
                     ui.horizontal_wrapped(|ui| {
-                        ui.label("View zoom");
+                        ui.label("View Zoom");
                         if ui.button("−").clicked() {
                             state.view_zoom = (state.view_zoom / 1.25).clamp(0.1, 4.0);
                         }
@@ -1240,7 +1538,7 @@ impl ScanToImgApp {
         let mut open = self.tone_open;
         let mut edits = self.workbench.current_edits();
         let mut changed = false;
-        egui::Window::new("Levels & curves")
+        egui::Window::new("Levels & Curves")
             .open(&mut open)
             .default_width(320.0)
             .resizable(false)
@@ -1308,7 +1606,7 @@ impl ScanToImgApp {
         ui.separator();
         ui.horizontal(|ui| {
             ui.strong("Tone curve");
-            if ui.button("Reset curve").clicked() {
+            if ui.button("Reset Curve").clicked() {
                 curve.reset();
                 changed = true;
             }
@@ -1406,7 +1704,7 @@ impl ScanToImgApp {
             {
                 self.workbench.set_show_edits(showing_original);
             }
-            if self.workbench.result().is_some() && ui.button("Show panorama").clicked() {
+            if self.workbench.result().is_some() && ui.button("Show Panorama").clicked() {
                 let _ = self.workbench.show_stitched();
                 self.picking_film_base = false;
             }
@@ -1418,7 +1716,7 @@ impl ScanToImgApp {
             if ui.button("+").clicked() {
                 self.preview.zoom = (self.preview.zoom * 1.25).min(20.0);
             }
-            if ui.button("Fit").clicked() {
+            if ui.button("Zoom to Fit").clicked() {
                 self.preview.zoom = 1.0;
                 self.preview.pan = egui::Vec2::ZERO;
             }
@@ -1513,12 +1811,40 @@ impl ScanToImgApp {
             self.preview.pan += response.drag_delta();
         }
         if response.hovered() {
-            let scroll = ui.input(|input| input.smooth_scroll_delta.y);
-            if scroll.abs() > 0.0 {
-                let factor = (scroll * 0.002).exp();
-                self.preview.zoom = (self.preview.zoom * factor).clamp(0.1, 20.0);
+            let gesture = ViewGesture::read(ui);
+            let anchor = gesture.pointer.unwrap_or(viewport.center());
+            let mut zoom = self.preview.zoom * gesture.zoom;
+            if response.double_clicked() && !self.crop_mode && !self.picking_film_base {
+                // Like Photos and Preview: double-click toggles between the
+                // fitted view and actual pixels around the clicked point.
+                let actual = (1.0 / fit).max(1.0);
+                zoom = if self.preview.zoom < actual * 0.99 {
+                    actual
+                } else {
+                    1.0
+                };
+            }
+            zoom = zoom.clamp(MIN_PREVIEW_ZOOM, (8.0 / fit).max(MAX_PREVIEW_ZOOM));
+            if zoom != self.preview.zoom {
+                let ratio = zoom / self.preview.zoom;
+                let image_center = viewport.center() + self.preview.pan;
+                let center = anchor - (anchor - image_center) * ratio;
+                self.preview.pan = center - viewport.center();
+                self.preview.zoom = zoom;
+            }
+            self.preview.pan += gesture.pan;
+            if zoom <= 1.0 && gesture.zoom < 1.0 {
+                // Zooming out past the fitted view recentres the photo.
+                self.preview.pan *= 0.8;
             }
         }
+        // Keep part of the photo in view, however far it is dragged.
+        let display = image_size * fit * self.preview.zoom;
+        let limit = (display + viewport.size()) * 0.5 - egui::vec2(48.0, 48.0);
+        self.preview.pan = self
+            .preview
+            .pan
+            .clamp(-limit.max(egui::Vec2::ZERO), limit.max(egui::Vec2::ZERO));
 
         if self.picking_film_base && !self.crop_mode && response.hovered() {
             ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
@@ -1586,15 +1912,32 @@ impl eframe::App for ScanToImgApp {
             self.add_paths(paths);
         }
 
+        for command in self.pending_commands(&ctx) {
+            self.run_command(&ctx, command);
+        }
+        #[cfg(target_os = "macos")]
+        if let Some(mut menu) = self.menu.take() {
+            menu.update(|command| self.can_run(command));
+            self.menu = Some(menu);
+        }
+
         if let Some(outcome) = self.dialog.show(&ctx) {
             self.handle_dialog_outcome(outcome);
         }
         self.tone_window(&ctx);
         self.arrange_window(&ctx);
 
-        egui::Panel::top("toolbar").show(ui, |ui| {
-            self.toolbar(&ctx, ui);
-        });
+        let toolbar_height = if cfg!(target_os = "macos") {
+            MACOS_TITLE_BAR_HEIGHT
+        } else {
+            36.0
+        };
+        egui::Panel::top("toolbar")
+            .exact_size(toolbar_height)
+            .resizable(false)
+            .show(ui, |ui| {
+                self.toolbar(&ctx, ui);
+            });
         egui::Panel::bottom("status").show(ui, |ui| {
             self.status_bar(ui);
         });
@@ -1613,20 +1956,23 @@ impl eframe::App for ScanToImgApp {
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
+                        if let Some(histogram) = self.workbench.histogram() {
+                            draw_histogram(ui, &histogram);
+                            ui.separator();
+                        }
                         self.develop(ui);
                         ui.separator();
-                        self.metadata(ui);
-                        ui.separator();
-                        if let Some(histogram) = self.workbench.histogram() {
-                            ui.heading("Histogram");
-                            draw_histogram(ui, &histogram);
-                        }
-                        ui.separator();
-                        egui::CollapsingHeader::new("Stitch settings")
+                        egui::CollapsingHeader::new("Metadata")
+                            .default_open(true)
+                            .show(ui, |ui| self.metadata(ui));
+                        egui::CollapsingHeader::new("Export")
+                            .default_open(false)
+                            .show(ui, |ui| self.export_settings(ui));
+                        egui::CollapsingHeader::new("Stitch Settings")
                             .default_open(false)
                             .show(ui, |ui| self.settings(ui));
                         egui::CollapsingHeader::new("Diagnostics")
-                            .default_open(true)
+                            .default_open(false)
                             .show(ui, |ui| self.diagnostics(ui));
                     });
             });
@@ -1643,6 +1989,118 @@ impl eframe::App for ScanToImgApp {
             }
         });
     }
+}
+
+const MIN_PREVIEW_ZOOM: f32 = 0.1;
+const MAX_PREVIEW_ZOOM: f32 = 20.0;
+
+/// Trackpad and mouse input for a zoomable view, following macOS conventions:
+/// two-finger scrolling pans (with system momentum), pinching or
+/// Command-scrolling zooms, and a mouse wheel without a modifier zooms too,
+/// since a wheel has no other use in a photo viewer.
+struct ViewGesture {
+    pan: egui::Vec2,
+    zoom: f32,
+    pointer: Option<egui::Pos2>,
+}
+
+impl ViewGesture {
+    fn read(ui: &egui::Ui) -> Self {
+        ui.input(|input| {
+            let mut pan = egui::Vec2::ZERO;
+            let mut zoom = input.zoom_delta();
+            for event in &input.events {
+                let egui::Event::MouseWheel {
+                    unit,
+                    delta,
+                    modifiers,
+                    ..
+                } = event
+                else {
+                    continue;
+                };
+                if modifiers.command || modifiers.ctrl {
+                    // egui already turned this into zoom_delta.
+                    continue;
+                }
+                match unit {
+                    egui::MouseWheelUnit::Point => pan += *delta,
+                    egui::MouseWheelUnit::Line => zoom *= (delta.y * 0.12).exp(),
+                    egui::MouseWheelUnit::Page => zoom *= (delta.y * 0.5).exp(),
+                }
+            }
+            Self {
+                pan,
+                zoom,
+                pointer: input.pointer.hover_pos(),
+            }
+        })
+    }
+}
+
+/// Width kept free for the close, minimize and zoom buttons when the toolbar
+/// shares the macOS title bar.
+const MACOS_WINDOW_CONTROLS_WIDTH: f32 = 70.0;
+/// Height of the standard macOS title bar, which the toolbar fills.
+const MACOS_TITLE_BAR_HEIGHT: f32 = 30.0;
+
+/// One row of the image source list: thumbnail, name and size, highlighted
+/// with the accent color when selected.
+fn source_row(
+    ui: &mut egui::Ui,
+    texture: &egui::TextureHandle,
+    image: &SourceImage,
+    selected: bool,
+) -> egui::Response {
+    let height = 48.0;
+    let (rect, response) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), height),
+        egui::Sense::click(),
+    );
+    let visuals = ui.visuals();
+    if selected {
+        ui.painter()
+            .rect_filled(rect, 6.0, visuals.selection.bg_fill);
+    } else if response.hovered() {
+        ui.painter()
+            .rect_filled(rect, 6.0, visuals.widgets.hovered.weak_bg_fill);
+    }
+    let thumb_bounds = egui::Rect::from_min_size(
+        rect.left_top() + egui::vec2(6.0, 4.0),
+        egui::vec2(52.0, height - 8.0),
+    );
+    let thumb = egui::Rect::from_center_size(
+        thumb_bounds.center(),
+        fit_size(texture.size_vec2(), thumb_bounds.size()),
+    );
+    ui.painter().image(
+        texture.id(),
+        thumb,
+        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+        egui::Color32::WHITE,
+    );
+    let (primary, secondary) = if selected {
+        (egui::Color32::WHITE, egui::Color32::from_white_alpha(200))
+    } else {
+        (visuals.text_color(), visuals.weak_text_color())
+    };
+    let text_left = thumb_bounds.right() + 8.0;
+    let painter = ui.painter_at(rect.shrink2(egui::vec2(4.0, 0.0)));
+    painter.text(
+        egui::pos2(text_left, rect.center().y - 8.0),
+        egui::Align2::LEFT_CENTER,
+        &image.name,
+        egui::FontId::proportional(13.0),
+        primary,
+    );
+    painter.text(
+        egui::pos2(text_left, rect.center().y + 9.0),
+        egui::Align2::LEFT_CENTER,
+        format!("{} × {}", image.image.width(), image.image.height()),
+        egui::FontId::proportional(11.0),
+        secondary,
+    );
+    response
 }
 
 fn metadata_field(ui: &mut egui::Ui, label: &str, hint: &str, value: &mut String) -> bool {
@@ -1757,7 +2215,7 @@ fn arrange_frame_controls(ui: &mut egui::Ui, state: &mut ArrangeState) -> bool {
                         .text("Scale"),
                 )
                 .changed();
-            if ui.button("Reset frame").clicked() {
+            if ui.button("Reset Frame").clicked() {
                 item.rotation = 0.0;
                 item.zoom = 1.0;
                 changed = true;
@@ -1773,99 +2231,116 @@ fn arrange_frame_controls(ui: &mut egui::Ui, state: &mut ArrangeState) -> bool {
 
 fn draw_arrange(ui: &mut egui::Ui, state: &mut ArrangeState) {
     let viewport = ui.available_size();
+    let viewport_rect = egui::Rect::from_min_size(ui.cursor().min, viewport);
     let scale = state.scale * state.view_zoom;
     let scene = state.scene;
     let desired = egui::vec2(
         (scene.width() * scale).max(viewport.x.max(320.0)),
         (scene.height() * scale).max(viewport.y.max(320.0)),
     );
-    egui::ScrollArea::both()
-        .auto_shrink([false, false])
-        .show(ui, |ui| {
-            let (response, painter) = ui.allocate_painter(desired, egui::Sense::hover());
-            let canvas = response.rect;
-            painter.rect_filled(canvas, 0.0, egui::Color32::from_gray(22));
-            let scene_px = scene.size() * scale;
-            let origin =
-                canvas.min + ((canvas.size() - scene_px) * 0.5) - scene.min.to_vec2() * scale;
+    let mut area = egui::ScrollArea::both().auto_shrink([false, false]);
+    if let Some(offset) = state.scroll_to.take() {
+        area = area.scroll_offset(offset);
+    }
+    let output = area.show(ui, |ui| {
+        let (response, painter) = ui.allocate_painter(desired, egui::Sense::hover());
+        let canvas = response.rect;
+        painter.rect_filled(canvas, 0.0, egui::Color32::from_gray(22));
+        let scene_px = scene.size() * scale;
+        let origin = canvas.min + ((canvas.size() - scene_px) * 0.5) - scene.min.to_vec2() * scale;
 
-            for index in 0..state.items.len() {
-                let (id, quad) = {
-                    let item = &state.items[index];
-                    (item.id, arrange_quad(item, origin, scale))
-                };
-                let bounds = egui::Rect::from_points(&quad);
-                let sense = if index == 0 {
-                    egui::Sense::click()
-                } else {
-                    egui::Sense::click_and_drag()
-                };
-                let interaction =
-                    ui.interact(bounds, ui.scope_id().with(("arrange-frame", id.0)), sense);
-                if interaction.clicked() {
+        for index in 0..state.items.len() {
+            let (id, quad) = {
+                let item = &state.items[index];
+                (item.id, arrange_quad(item, origin, scale))
+            };
+            let bounds = egui::Rect::from_points(&quad);
+            let sense = if index == 0 {
+                egui::Sense::click()
+            } else {
+                egui::Sense::click_and_drag()
+            };
+            let interaction =
+                ui.interact(bounds, ui.scope_id().with(("arrange-frame", id.0)), sense);
+            if interaction.clicked() {
+                state.selected = Some(index);
+            }
+            if index > 0 {
+                if interaction.drag_started() {
+                    state.drag = Some(index);
                     state.selected = Some(index);
                 }
-                if index > 0 {
-                    if interaction.drag_started() {
-                        state.drag = Some(index);
-                        state.selected = Some(index);
-                    }
-                    if interaction.dragged() && state.drag == Some(index) {
-                        state.items[index].position += interaction.drag_delta() / scale;
-                    }
-                    if interaction.drag_stopped() && state.drag == Some(index) {
-                        state.drag = None;
-                    }
-                    if interaction.hovered() {
-                        ui.ctx().set_cursor_icon(if interaction.dragged() {
-                            egui::CursorIcon::Grabbing
-                        } else {
-                            egui::CursorIcon::Grab
-                        });
-                    }
+                if interaction.dragged() && state.drag == Some(index) {
+                    state.items[index].position += interaction.drag_delta() / scale;
                 }
-
-                let item = &state.items[index];
-                let quad = arrange_quad(item, origin, scale);
-                let mut mesh = egui::Mesh::with_texture(item.texture.id());
-                let uvs = [
-                    egui::pos2(0.0, 0.0),
-                    egui::pos2(1.0, 0.0),
-                    egui::pos2(1.0, 1.0),
-                    egui::pos2(0.0, 1.0),
-                ];
-                for (position, uv) in quad.into_iter().zip(uvs) {
-                    mesh.vertices.push(egui::epaint::Vertex {
-                        pos: position,
-                        uv,
-                        color: egui::Color32::WHITE,
+                if interaction.drag_stopped() && state.drag == Some(index) {
+                    state.drag = None;
+                }
+                if interaction.hovered() {
+                    ui.ctx().set_cursor_icon(if interaction.dragged() {
+                        egui::CursorIcon::Grabbing
+                    } else {
+                        egui::CursorIcon::Grab
                     });
                 }
-                mesh.indices.extend_from_slice(&[0, 1, 2, 0, 2, 3]);
-                painter.add(egui::Shape::mesh(mesh));
-
-                let stroke = if state.drag == Some(index) || state.selected == Some(index) {
-                    egui::Stroke::new(2.0_f32, egui::Color32::from_rgb(255, 200, 60))
-                } else if index == 0 {
-                    egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(90, 170, 240))
-                } else {
-                    egui::Stroke::new(1.0_f32, egui::Color32::from_gray(120))
-                };
-                painter.add(egui::Shape::closed_line(quad.to_vec(), stroke));
-                let caption = if index == 0 {
-                    format!("1 · {} · reference", item.name)
-                } else {
-                    format!("{} · {}", index + 1, item.name)
-                };
-                painter.text(
-                    egui::Rect::from_points(&quad).left_top() + egui::vec2(5.0, 4.0),
-                    egui::Align2::LEFT_TOP,
-                    caption,
-                    egui::FontId::proportional(12.0),
-                    egui::Color32::WHITE,
-                );
             }
-        });
+
+            let item = &state.items[index];
+            let quad = arrange_quad(item, origin, scale);
+            let mut mesh = egui::Mesh::with_texture(item.texture.id());
+            let uvs = [
+                egui::pos2(0.0, 0.0),
+                egui::pos2(1.0, 0.0),
+                egui::pos2(1.0, 1.0),
+                egui::pos2(0.0, 1.0),
+            ];
+            for (position, uv) in quad.into_iter().zip(uvs) {
+                mesh.vertices.push(egui::epaint::Vertex {
+                    pos: position,
+                    uv,
+                    color: egui::Color32::WHITE,
+                });
+            }
+            mesh.indices.extend_from_slice(&[0, 1, 2, 0, 2, 3]);
+            painter.add(egui::Shape::mesh(mesh));
+
+            let stroke = if state.drag == Some(index) || state.selected == Some(index) {
+                egui::Stroke::new(2.0_f32, egui::Color32::from_rgb(255, 200, 60))
+            } else if index == 0 {
+                egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(90, 170, 240))
+            } else {
+                egui::Stroke::new(1.0_f32, egui::Color32::from_gray(120))
+            };
+            painter.add(egui::Shape::closed_line(quad.to_vec(), stroke));
+            let caption = if index == 0 {
+                format!("1 · {} · reference", item.name)
+            } else {
+                format!("{} · {}", index + 1, item.name)
+            };
+            painter.text(
+                egui::Rect::from_points(&quad).left_top() + egui::vec2(5.0, 4.0),
+                egui::Align2::LEFT_TOP,
+                caption,
+                egui::FontId::proportional(12.0),
+                egui::Color32::WHITE,
+            );
+        }
+    });
+
+    // Two-finger scrolling pans through the scroll area; a pinch zooms the
+    // layout around the pointer.
+    let pointer = ui.input(|input| input.pointer.hover_pos());
+    let zoom = ui.input(|input| input.zoom_delta());
+    if let Some(pointer) = pointer.filter(|pointer| viewport_rect.contains(*pointer)) {
+        let view_zoom = (state.view_zoom * zoom).clamp(0.1, 4.0);
+        if view_zoom != state.view_zoom {
+            let ratio = view_zoom / state.view_zoom;
+            let local = pointer - viewport_rect.min;
+            let offset = (output.state.clamped_offset() + local) * ratio - local;
+            state.view_zoom = view_zoom;
+            state.scroll_to = Some(offset.max(egui::Vec2::ZERO));
+        }
+    }
 }
 
 fn curve_to_screen(point: CurvePoint, rect: egui::Rect) -> egui::Pos2 {
