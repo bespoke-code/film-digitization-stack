@@ -1,7 +1,7 @@
-//! Use case: register 1..=6 images and composite a panorama.
+//! Use case: register up to sixteen images and composite a panorama.
 
-use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, OnceLock};
+use std::time::Instant;
 
 use stitch_domain::{
     Clock, ColorCurve, Compositor, CoreError, CoreResult, FeatureExtractor, FeatureMatcher,
@@ -15,16 +15,15 @@ use crate::bundle::{refine_transforms, PairLink};
 use crate::canvas::plan_canvas;
 use crate::color::calibrate_color_curves;
 
-/// Wall-clock implementation of [`Clock`].
+/// Monotonic implementation of [`Clock`]. Wall-clock time can jump backwards
+/// and would corrupt durations, so milliseconds count from the first call.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SystemClock;
 
 impl Clock for SystemClock {
     fn now_ms(&self) -> u64 {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|duration| duration.as_millis() as u64)
-            .unwrap_or(0)
+        static EPOCH: OnceLock<Instant> = OnceLock::new();
+        EPOCH.get_or_init(Instant::now).elapsed().as_millis() as u64
     }
 }
 
@@ -574,25 +573,22 @@ struct Candidate {
     diagnostic_index: usize,
 }
 
-/// Builds the overlap list from the tree pairs and calibrates all images at
-/// once. Pair transforms come from the final canvas transforms so the
-/// calibration matches what the compositor actually blends.
+/// Calibrates all images at once from every accepted overlap. Pair
+/// transforms come from the final canvas transforms so the calibration
+/// matches what the compositor actually blends.
 ///
-/// Only the tree pairs feed the calibration. They are the large, centred
-/// overlaps that the registration chose, and they are the only ones where both
-/// frames see the same part of the negative through the same part of the lens.
-/// Long-range pairs meet at frame corners, where vignetting mimics an exposure
-/// difference and would distort a whole frame's curve.
+/// The registration tree alone is a chain: a calibration fitted only along it
+/// drifts at the far end, and two frames that overlap directly but sit far
+/// apart in the chain then blend with a visible step. The long-range pairs
+/// close those loops. The gain prior and the outlier limit in the curve fit
+/// keep a vignetted corner overlap from bending a whole frame.
 fn calibrate_registered_colors(
     images: &[SourceImage],
     transforms: &[Option<Homography>],
     diagnostics: &[PairDiagnostics],
 ) -> Vec<ColorCurve> {
     let mut overlaps = Vec::new();
-    for pair in diagnostics
-        .iter()
-        .filter(|pair| pair.accepted && pair.used_for_alignment)
-    {
+    for pair in diagnostics.iter().filter(|pair| pair.accepted) {
         let Some(query) = image_index(images, pair.from) else {
             continue;
         };

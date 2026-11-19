@@ -86,7 +86,7 @@ impl ImageRepository for FileImageRepository {
             }
         }
 
-        let image = to_domain(rgba.clone());
+        let image = to_domain(rgba);
         let thumbnail = image.thumbnail(self.thumbnail_size.max(32));
 
         Ok(LoadedImage {

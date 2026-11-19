@@ -212,6 +212,27 @@ pub fn compositor_contract(compositor: &dyn Compositor) {
     assert_eq!(blended[3], 255);
     assert_eq!(overlap.pixel(190, 20)[3], 0);
 
+    let toned = compositor
+        .composite(
+            &[WarpLayer {
+                name: "toned".to_owned(),
+                image: Arc::new(RgbaImage::filled(8, 8, [100, 50, 25, 255])),
+                homography: Homography::identity(),
+                color: ColorCurve::from_gain([2.0, 0.5, 1.0]),
+            }],
+            &WarpOptions {
+                canvas_width: 8,
+                canvas_height: 8,
+                feather_fraction: 0.0,
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        toned.pixel(4, 4),
+        [200, 25, 25, 255],
+        "the layer color curve must be applied"
+    );
+
     assert!(compositor.composite(&[], &options).is_err());
 }
 

@@ -320,10 +320,12 @@ fn detect_and_describe(image: &GrayImage, config: &SiftConfig) -> FeatureSet {
                         else {
                             continue;
                         };
+                        // Each 2x2 average moves pixel centres by half a
+                        // pixel, so map through centres, not corners.
                         features.push(Feature {
                             keypoint: Keypoint {
-                                x: rx * scale_factor,
-                                y: ry * scale_factor,
+                                x: (rx + 0.5) * scale_factor - 0.5,
+                                y: (ry + 0.5) * scale_factor - 0.5,
                                 scale: local_sigma * scale_factor,
                                 orientation,
                                 response: center.abs(),
@@ -507,15 +509,16 @@ fn orientation_histogram(plane: &Plane, x: i32, y: i32, sigma: f32) -> Vec<f32> 
         }
     }
 
-    // Two passes of Lowe's smoothing kernel.
+    // Two passes of a centred binomial kernel. An off-centre kernel would
+    // shift every peak and bias the reported orientation.
     for _ in 0..2 {
         let previous = histogram;
         for i in 0..36 {
-            histogram[i] = (previous[(i + 35) % 36]
-                + 4.0 * previous[i]
-                + 6.0 * previous[(i + 1) % 36]
-                + 4.0 * previous[(i + 2) % 36]
-                + previous[(i + 3) % 36])
+            histogram[i] = (previous[(i + 34) % 36]
+                + 4.0 * previous[(i + 35) % 36]
+                + 6.0 * previous[i]
+                + 4.0 * previous[(i + 1) % 36]
+                + previous[(i + 2) % 36])
                 / 16.0;
         }
     }
@@ -536,8 +539,9 @@ fn orientation_histogram(plane: &Plane, x: i32, y: i32, sigma: f32) -> Vec<f32> 
             } else {
                 0.0
             };
-            let angle = (i as f32 + 0.5 + offset) * TAU / 36.0 - PI;
-            orientations.push(angle);
+            // Linear voting centres bin `i` on position `i`, not `i + 0.5`.
+            let angle = (i as f32 + offset) * TAU / 36.0 - PI;
+            orientations.push((angle + PI).rem_euclid(TAU) - PI);
         }
     }
     orientations
@@ -740,6 +744,62 @@ mod tests {
                 actual.distance(wanted) < 4.0,
                 "expected {wanted:?}, got {actual:?} (inliers {})",
                 estimate.inliers.len()
+            );
+        }
+    }
+
+    #[test]
+    fn orientation_follows_the_dominant_gradient() {
+        for degrees in [-150.0f32, -60.0, 0.0, 35.0, 120.0, 175.0] {
+            let angle = degrees.to_radians();
+            let (sin, cos) = angle.sin_cos();
+            let plane = Plane {
+                width: 64,
+                height: 64,
+                data: (0..64 * 64)
+                    .map(|index| {
+                        let x = (index % 64) as f32 - 32.0;
+                        let y = (index / 64) as f32 - 32.0;
+                        0.5 + 0.004 * (x * cos + y * sin)
+                    })
+                    .collect(),
+            };
+            let orientations = orientation_histogram(&plane, 32, 32, 2.0);
+            assert_eq!(orientations.len(), 1, "{degrees}°: {orientations:?}");
+            let error = (orientations[0] - angle + PI).rem_euclid(TAU) - PI;
+            assert!(
+                error.abs() < 3f32.to_radians(),
+                "{degrees}° reported as {}°",
+                orientations[0].to_degrees()
+            );
+        }
+    }
+
+    #[test]
+    fn keypoints_from_coarse_octaves_keep_their_position() {
+        // A bright disc is detected in a downsampled octave. Its keypoint must
+        // land on the disc centre in input coordinates, not half a coarse
+        // pixel away.
+        let (cx, cy) = (100.0f32, 90.0f32);
+        let image = GrayImage::from_fn(200, 180, |x, y| {
+            let dx = x as f32 - cx;
+            let dy = y as f32 - cy;
+            0.2 + 0.6 * (-(dx * dx + dy * dy) / (2.0 * 9.0 * 9.0)).exp()
+        });
+        let features = SiftExtractor::default().extract(&image).unwrap();
+        let coarse: Vec<_> = features
+            .iter()
+            .filter(|feature| feature.keypoint.scale > 6.0)
+            .collect();
+        assert!(!coarse.is_empty(), "no coarse keypoint on the disc");
+        for feature in coarse {
+            let error =
+                ((feature.keypoint.x - cx).powi(2) + (feature.keypoint.y - cy).powi(2)).sqrt();
+            assert!(
+                error < 0.75,
+                "keypoint at ({}, {}) is {error:.2} px off",
+                feature.keypoint.x,
+                feature.keypoint.y
             );
         }
     }

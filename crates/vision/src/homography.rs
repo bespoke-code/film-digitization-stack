@@ -651,13 +651,7 @@ mod tests {
         }
     }
 
-    #[test]
-    fn rejects_a_geometrically_implausible_transform() {
-        // A false match set can be perfectly consistent with a homography that
-        // mirrors or wildly distorts the scan. It must not be accepted just
-        // because RANSAC found many inliers.
-        let mirroring =
-            Homography::from_rows([[0.33, 0.0, 275.0], [0.0, 4.58, 500.0], [0.0, 0.0, 1.0]]);
+    fn assert_rejected(transform: Homography) {
         let source: Vec<Point> = (0..8)
             .flat_map(|y| {
                 (0..8).map(move |x| Point::new(40.0 + x as f64 * 30.0, 30.0 + y as f64 * 28.0))
@@ -665,20 +659,45 @@ mod tests {
             .collect();
         let destination: Vec<Point> = source
             .iter()
-            .map(|point| mirroring.transform(*point).unwrap())
+            .map(|point| transform.transform(*point).unwrap())
             .collect();
         let query = feature_set(&source);
         let train = feature_set(&destination);
         let all_matches: Vec<FeatureMatch> = (0..source.len())
             .map(|i| FeatureMatch::new(i, i, 1.0))
             .collect();
-        let error = RansacHomographyEstimator::default()
-            .estimate(&query, &train, &all_matches, &StitchOptions::default())
-            .unwrap_err();
-        assert!(
-            matches!(error, CoreError::Homography(_)),
-            "unexpected success: {error}"
+        let result = RansacHomographyEstimator::default().estimate(
+            &query,
+            &train,
+            &all_matches,
+            &StitchOptions::default(),
         );
+        assert!(
+            matches!(result, Err(CoreError::Homography(_))),
+            "unexpected success: {:?}",
+            result.map(|estimate| estimate.homography)
+        );
+    }
+
+    // A false match set can be perfectly consistent with a homography that
+    // mirrors or wildly distorts the scan. It must not be accepted just
+    // because RANSAC found many inliers.
+    #[test]
+    fn rejects_an_anisotropic_stretch() {
+        assert_rejected(Homography::from_rows([
+            [0.33, 0.0, 275.0],
+            [0.0, 4.58, 500.0],
+            [0.0, 0.0, 1.0],
+        ]));
+    }
+
+    #[test]
+    fn rejects_a_mirrored_transform() {
+        assert_rejected(Homography::from_rows([
+            [-1.0, 0.0, 400.0],
+            [0.0, 1.0, 10.0],
+            [0.0, 0.0, 1.0],
+        ]));
     }
 
     #[test]

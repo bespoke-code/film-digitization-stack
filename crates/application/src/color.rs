@@ -75,10 +75,11 @@ fn solve_gains(images: &[&RgbaImage], overlaps: &[(usize, usize, Homography)]) -
         if scale <= f64::EPSILON {
             continue;
         }
+        // The prior pulls every log gain toward zero, which is unit gain. An
+        // image without overlaps then keeps its exposure instead of drifting.
         let lambda = CALIBRATION_REGULARIZATION * scale;
-        for index in 0..unknowns {
-            normal[index][index] += lambda;
-            rhs[index] += lambda;
+        for (index, row) in normal.iter_mut().enumerate() {
+            row[index] += lambda;
         }
 
         let solution = solve_linear(normal, rhs);
@@ -464,6 +465,38 @@ mod tests {
         let curves = calibrate_color_curves(&[&first, &second], &[]);
         assert!(curves[0].is_identity());
         assert!(curves[1].is_identity());
+    }
+
+    #[test]
+    fn an_image_without_overlaps_keeps_its_tones() {
+        // A rough-arranged, featureless frame has no overlap equations. It
+        // must not inherit a gain from the regularization.
+        let target = gradient(128, 96);
+        let darker = scaled(&target, [0.8, 0.8, 0.8]);
+        let isolated = gradient(64, 64);
+        let images = [&target, &darker, &isolated];
+        let overlaps = [(1, 0, Homography::identity())];
+        let gains = solve_gains(&images, &overlaps);
+        for channel in 0..3 {
+            assert!(
+                (gains[2][channel] - 1.0).abs() < 1e-6,
+                "isolated gain {:?}",
+                gains[2]
+            );
+            assert!(
+                (gains[1][channel] - 1.25).abs() < 0.05,
+                "connected gain {:?}",
+                gains[1]
+            );
+        }
+        let curves = calibrate_color_curves(&images, &overlaps);
+        for level in [16u8, 64, 128, 200, 250] {
+            let mapped = curves[2].map([level; 3]);
+            assert!(
+                mapped.iter().all(|value| value.abs_diff(level) <= 1),
+                "level {level} mapped to {mapped:?}"
+            );
+        }
     }
 
     #[test]

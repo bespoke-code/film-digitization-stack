@@ -234,4 +234,23 @@ fn registers_a_rotated_scan() {
         .iter()
         .any(|pair| pair.used_for_alignment && pair.num_inliers >= 12));
     assert!(result.image.width() > 640 && result.image.height() > 480);
+
+    // A point of the base must land on the same canvas pixel through either
+    // frame, otherwise the size check above passes with a wrong transform.
+    for probe in [
+        stitch_domain::Point::new(80.0, 60.0),
+        stitch_domain::Point::new(560.0, 90.0),
+        stitch_domain::Point::new(320.0, 400.0),
+    ] {
+        let through_base = result.placements[0].homography.transform(probe).unwrap();
+        let in_rotated = transform.transform(probe).unwrap();
+        let through_rotated = result.placements[1]
+            .homography
+            .transform(in_rotated)
+            .unwrap();
+        assert!(
+            through_base.distance(through_rotated) < 1.5,
+            "{probe:?}: {through_base:?} vs {through_rotated:?}"
+        );
+    }
 }

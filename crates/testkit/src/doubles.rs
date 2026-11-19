@@ -382,7 +382,7 @@ fn normalize(points: &[Point]) -> (Vec<Point>, Homography) {
 }
 
 /// Sequential compositor with the same semantics as the production adapter but
-/// without rayon or feathering.
+/// without rayon, feathering or focus weighting.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct InMemoryCompositor;
 
@@ -414,9 +414,10 @@ impl Compositor for InMemoryCompositor {
                         continue;
                     }
                     let index = y as usize * width as usize + x as usize;
-                    accum[index * 3] += color[0] as f32 * alpha;
-                    accum[index * 3 + 1] += color[1] as f32 * alpha;
-                    accum[index * 3 + 2] += color[2] as f32 * alpha;
+                    let toned = layer.color.map([color[0], color[1], color[2]]);
+                    accum[index * 3] += toned[0] as f32 * alpha;
+                    accum[index * 3 + 1] += toned[1] as f32 * alpha;
+                    accum[index * 3 + 2] += toned[2] as f32 * alpha;
                     weights[index] += alpha;
                 }
             }

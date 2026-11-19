@@ -82,13 +82,13 @@ impl Compositor for BilinearCompositor {
         if layers.is_empty() {
             return Err(CoreError::EmptyProject);
         }
-        let width = options.canvas_width.max(1) as usize;
-        let height = options.canvas_height.max(1) as usize;
-        if width == 0 || height == 0 {
+        if options.canvas_width == 0 || options.canvas_height == 0 {
             return Err(CoreError::Compositing(
                 "the output canvas is empty".to_owned(),
             ));
         }
+        let width = options.canvas_width as usize;
+        let height = options.canvas_height as usize;
 
         let mut prepared = prepare_layers(layers, options)?;
         let reference_focus = prepared

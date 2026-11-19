@@ -218,6 +218,7 @@ fn real_scans_blend_overlaps_without_visible_steps() {
     let result = stitch(&images);
 
     let mut checked = 0;
+    let mut located = 0;
     let mut reports = Vec::new();
     for pair in result.diagnostics.pairs.iter().filter(|pair| pair.accepted) {
         let query = pair.from.0 as usize - 1;
@@ -271,6 +272,14 @@ fn real_scans_blend_overlaps_without_visible_steps() {
             to,
             report.correlation
         );
+        // A featureless overlap, such as sky on a soft frame, has a flat
+        // error surface whose minimum follows the vignetting gradient instead
+        // of the content. Its shift says nothing about the registration;
+        // correlation and residual above still guard it.
+        if report.shift_contrast < 0.10 {
+            continue;
+        }
+        located += 1;
         assert!(
             report.shift.0.abs() <= 5 && report.shift.1.abs() <= 5,
             "{} -> {} is off by {:?} px",
@@ -280,6 +289,10 @@ fn real_scans_blend_overlaps_without_visible_steps() {
         );
     }
     assert!(checked >= 6, "only {checked} overlaps were verified");
+    assert!(
+        located >= 4,
+        "only {located} of {checked} overlaps had structure to locate"
+    );
 }
 
 struct Agreement {
@@ -288,6 +301,9 @@ struct Agreement {
     bias: f64,
     correlation: f64,
     shift: (i32, i32),
+    /// Relative rise of the shift error eight pixels away from its minimum.
+    /// A flat surface means the overlap has no structure to locate.
+    shift_contrast: f64,
 }
 
 fn overlap_agreement(
@@ -335,6 +351,7 @@ fn overlap_agreement(
             bias: f64::MAX,
             correlation: 0.0,
             shift: (0, 0),
+            shift_contrast: 0.0,
         };
     }
 
@@ -375,22 +392,24 @@ fn overlap_agreement(
         0.0
     };
 
-    let shift = best_shift(&points, &luma_a, target, target_curve);
+    let (shift, shift_contrast) = best_shift(&points, &luma_a, target, target_curve);
     Agreement {
         samples,
         residual,
         bias,
         correlation,
         shift,
+        shift_contrast,
     }
 }
 
+/// Returns the shift with the lowest error and how distinct that minimum is.
 fn best_shift(
     points: &[(f64, f64)],
     values: &[f64],
     target: &stitch_domain::RgbaImage,
     target_curve: &stitch_domain::ColorCurve,
-) -> (i32, i32) {
+) -> ((i32, i32), f64) {
     let mut best = (0i32, 0i32, f64::MAX);
     for dy in (-8..=8).step_by(2) {
         for dx in (-8..=8).step_by(2) {
@@ -409,7 +428,36 @@ fn best_shift(
             }
         }
     }
-    (best.0, best.1)
+    let ring = [
+        (-8, 0),
+        (8, 0),
+        (0, -8),
+        (0, 8),
+        (-8, -8),
+        (8, -8),
+        (-8, 8),
+        (8, 8),
+    ];
+    let ring_error = ring
+        .iter()
+        .map(|(dx, dy)| {
+            shift_error(
+                points,
+                values,
+                target,
+                target_curve,
+                best.0 + dx,
+                best.1 + dy,
+            )
+        })
+        .sum::<f64>()
+        / ring.len() as f64;
+    let contrast = if best.2 > 0.0 {
+        (ring_error - best.2) / best.2
+    } else {
+        0.0
+    };
+    ((best.0, best.1), contrast)
 }
 
 fn shift_error(
