@@ -1,6 +1,6 @@
 [Desktop Entry]
 Type=Application
-Name=Scan to image
+Name=Scan to Image
 GenericName=Film Scan Stitcher
 Comment=Stitch and invert film scans
 Exec=@EXEC@ %F

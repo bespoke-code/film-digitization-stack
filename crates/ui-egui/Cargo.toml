@@ -16,6 +16,12 @@ egui-wgpu.workspace = true
 eframe.workspace = true
 log.workspace = true
 
+# Native menu bar and Open/Save panels on macOS. Linux keeps the in-app
+# dialog, which needs no GTK or portal libraries.
+[target.'cfg(target_os = "macos")'.dependencies]
+muda = { version = "0.21", default-features = false }
+rfd = { version = "0.18", default-features = false }
+
 [dev-dependencies]
 tempfile.workspace = true
 

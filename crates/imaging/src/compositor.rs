@@ -9,9 +9,6 @@ use stitch_domain::{
     WarpOptions,
 };
 
-/// Rows accumulated at once. Bounded band memory lets the compositor work at
-/// full scan resolution without allocating a canvas-sized float accumulator.
-const BAND_ROWS: usize = 128;
 const ANALYSIS_LIMIT: u32 = 1024;
 const FOCUS_TILE_COLUMNS: usize = 8;
 const FOCUS_TILE_ROWS: usize = 8;
@@ -26,8 +23,8 @@ const EDGE_CROP_FRACTION: f64 = 0.02;
 /// are averaged with a smooth edge weight and a local focus weight, so a soft
 /// frame cannot smear detail over a sharp one. A frame edge fades out when a
 /// neighbour covers it, which keeps vignetting and rebate out of the blend
-/// without cutting the panorama. Rows are processed in bands, keeping memory
-/// independent of the canvas area.
+/// without cutting the panorama. Each worker accumulates one row at a time, so
+/// the float scratch memory is independent of the canvas area.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct BilinearCompositor;
 
@@ -45,6 +42,9 @@ struct PreparedLayer {
     min_y: i64,
     max_x: i64,
     max_y: i64,
+    /// Canvas outline of the source pixel area when it is convex, used to clip
+    /// each row to the pixels the layer can cover.
+    outline: Option<[Point; 4]>,
     feather: f64,
     crop: f64,
     focus: FocusMap,
@@ -52,6 +52,50 @@ struct PreparedLayer {
 }
 
 impl PreparedLayer {
+    /// Canvas columns of row `y` that can sample this layer. The span is
+    /// widened by one pixel so rounding never drops a covered pixel; the
+    /// sampler still rejects the points outside the source.
+    fn row_span(&self, y: i64) -> Option<(i64, i64)> {
+        if y < self.min_y || y > self.max_y {
+            return None;
+        }
+        let Some(outline) = &self.outline else {
+            return Some((self.min_x, self.max_x));
+        };
+        let row = y as f64;
+        let mut low = f64::INFINITY;
+        let mut high = f64::NEG_INFINITY;
+        for index in 0..4 {
+            let a = outline[index];
+            let b = outline[(index + 1) % 4];
+            if (a.y - row) * (b.y - row) > 0.0 {
+                continue;
+            }
+            if a.y == b.y {
+                low = low.min(a.x.min(b.x));
+                high = high.max(a.x.max(b.x));
+            } else {
+                let x = a.x + (row - a.y) * (b.x - a.x) / (b.y - a.y);
+                low = low.min(x);
+                high = high.max(x);
+            }
+        }
+        if !low.is_finite() || !high.is_finite() {
+            let top = outline.iter().map(|p| p.y).fold(f64::INFINITY, f64::min);
+            let bottom = outline
+                .iter()
+                .map(|p| p.y)
+                .fold(f64::NEG_INFINITY, f64::max);
+            if row < top - 1.0 || row > bottom + 1.0 {
+                return None;
+            }
+            return Some((self.min_x, self.max_x));
+        }
+        let start = (low.floor() as i64 - 1).max(self.min_x);
+        let end = (high.ceil() as i64 + 1).min(self.max_x);
+        (start <= end).then_some((start, end))
+    }
+
     /// How deeply this layer covers the canvas point: zero at the edge of its
     /// crop band, one a crop band further in, and zero outside the layer. A
     /// deep neighbour may replace an edge pixel without leaving a hole, and
@@ -103,108 +147,98 @@ impl Compositor for BilinearCompositor {
         }
 
         let mut output = vec![0u8; width * height * 4];
-        for band_start in (0..height).step_by(BAND_ROWS) {
-            let band_end = (band_start + BAND_ROWS).min(height);
-            let band_height = band_end - band_start;
-            let mut accum_rgb = vec![0.0f32; band_height * width * 3];
-            let mut accum_weight = vec![0.0f32; band_height * width];
-
-            accum_rgb
-                .par_chunks_mut(width * 3)
-                .zip(accum_weight.par_chunks_mut(width))
-                .enumerate()
-                .for_each(|(local_y, (rgb_row, weight_row))| {
-                    let y = band_start + local_y;
-                    for layer in &prepared {
-                        if (y as i64) < layer.min_y || (y as i64) > layer.max_y {
+        output.par_chunks_mut(width * 4).enumerate().for_each_init(
+            || (vec![0.0f32; width * 3], vec![0.0f32; width]),
+            |(rgb_row, weight_row), (y, out_row)| {
+                let mut touched_start = width;
+                let mut touched_end = 0;
+                for layer in &prepared {
+                    let Some((start_x, end_x)) = layer.row_span(y as i64) else {
+                        continue;
+                    };
+                    touched_start = touched_start.min(start_x as usize);
+                    touched_end = touched_end.max(end_x as usize + 1);
+                    for x in start_x..=end_x {
+                        let Some((sample_x, sample_y)) =
+                            inverse_point(&layer.inverse, x as f64, y as f64)
+                        else {
+                            continue;
+                        };
+                        let Some(color) = layer.image.sample_bilinear(sample_x, sample_y) else {
+                            continue;
+                        };
+                        let alpha = color[3] as f32 / 255.0;
+                        if alpha <= 0.0 {
                             continue;
                         }
-                        for x in layer.min_x..=layer.max_x {
-                            let Some((sample_x, sample_y)) =
-                                inverse_point(&layer.inverse, x as f64, y as f64)
-                            else {
-                                continue;
-                            };
-                            let Some(color) = layer.image.sample_bilinear(sample_x, sample_y)
-                            else {
-                                continue;
-                            };
-                            let alpha = color[3] as f32 / 255.0;
-                            if alpha <= 0.0 {
-                                continue;
-                            }
-                            let distance = sample_x
-                                .min(sample_y)
-                                .min(layer.image.width() as f64 - 1.0 - sample_x)
-                                .min(layer.image.height() as f64 - 1.0 - sample_y);
-                            let local_focus = layer.focus.at(
-                                sample_x,
-                                sample_y,
-                                layer.image.width(),
-                                layer.image.height(),
-                            );
-                            let sharpness = if reference_focus <= 0.0 || local_focus <= 0.0 {
-                                layer.focus_weight
-                            } else {
-                                (local_focus / reference_focus)
-                                    .clamp(MIN_FOCUS_WEIGHT, 1.0)
-                                    .min(layer.focus_weight)
-                            };
-                            let edge = if distance < layer.crop && layer.crop > 0.0 {
-                                let t = (distance / layer.crop).clamp(0.0, 1.0);
-                                let ramp = t * t * (3.0 - 2.0 * t);
-                                let mut coverage = 0.0f64;
-                                for other in &prepared {
-                                    if std::ptr::eq(other, layer) {
-                                        continue;
-                                    }
-                                    coverage = coverage.max(other.coverage(x as f64, y as f64));
-                                    if coverage >= 1.0 {
-                                        break;
-                                    }
+                        let distance = sample_x
+                            .min(sample_y)
+                            .min(layer.image.width() as f64 - 1.0 - sample_x)
+                            .min(layer.image.height() as f64 - 1.0 - sample_y);
+                        let local_focus = layer.focus.at(
+                            sample_x,
+                            sample_y,
+                            layer.image.width(),
+                            layer.image.height(),
+                        );
+                        let sharpness = if reference_focus <= 0.0 || local_focus <= 0.0 {
+                            layer.focus_weight
+                        } else {
+                            (local_focus / reference_focus)
+                                .clamp(MIN_FOCUS_WEIGHT, 1.0)
+                                .min(layer.focus_weight)
+                        };
+                        let edge = if distance < layer.crop && layer.crop > 0.0 {
+                            let t = (distance / layer.crop).clamp(0.0, 1.0);
+                            let ramp = t * t * (3.0 - 2.0 * t);
+                            let mut coverage = 0.0f64;
+                            for other in &prepared {
+                                if std::ptr::eq(other, layer) {
+                                    continue;
                                 }
-                                1.0 - (1.0 - ramp) * coverage
-                            } else {
-                                1.0
-                            };
-                            let weight = (feather_weight(distance, layer.feather) as f64
-                                * sharpness
-                                * alpha as f64
-                                * edge) as f32;
-                            if weight <= 0.0 {
-                                continue;
+                                coverage = coverage.max(other.coverage(x as f64, y as f64));
+                                if coverage >= 1.0 {
+                                    break;
+                                }
                             }
-                            let base = x as usize * 3;
-                            rgb_row[base] += layer.lut[0][color[0] as usize] as f32 * weight;
-                            rgb_row[base + 1] += layer.lut[1][color[1] as usize] as f32 * weight;
-                            rgb_row[base + 2] += layer.lut[2][color[2] as usize] as f32 * weight;
-                            weight_row[x as usize] += weight;
-                        }
-                    }
-                });
-
-            let band_output = &mut output[band_start * width * 4..band_end * width * 4];
-            band_output
-                .par_chunks_mut(width * 4)
-                .zip(accum_rgb.par_chunks(width * 3))
-                .zip(accum_weight.par_chunks(width))
-                .for_each(|((out_row, rgb_row), weight_row)| {
-                    for (x, weight) in weight_row.iter().copied().enumerate() {
-                        if weight <= 1e-8 {
+                            1.0 - (1.0 - ramp) * coverage
+                        } else {
+                            1.0
+                        };
+                        let weight = (feather_weight(distance, layer.feather) as f64
+                            * sharpness
+                            * alpha as f64
+                            * edge) as f32;
+                        if weight <= 0.0 {
                             continue;
                         }
-                        let base_in = x * 3;
-                        let base_out = x * 4;
-                        out_row[base_out] =
-                            (rgb_row[base_in] / weight).round().clamp(0.0, 255.0) as u8;
-                        out_row[base_out + 1] =
-                            (rgb_row[base_in + 1] / weight).round().clamp(0.0, 255.0) as u8;
-                        out_row[base_out + 2] =
-                            (rgb_row[base_in + 2] / weight).round().clamp(0.0, 255.0) as u8;
-                        out_row[base_out + 3] = 255;
+                        let base = x as usize * 3;
+                        rgb_row[base] += layer.lut[0][color[0] as usize] as f32 * weight;
+                        rgb_row[base + 1] += layer.lut[1][color[1] as usize] as f32 * weight;
+                        rgb_row[base + 2] += layer.lut[2][color[2] as usize] as f32 * weight;
+                        weight_row[x as usize] += weight;
                     }
-                });
-        }
+                }
+                if touched_start >= touched_end {
+                    return;
+                }
+                let span = touched_start..touched_end;
+                for ((weight, rgb), out) in weight_row[span.clone()]
+                    .iter_mut()
+                    .zip(rgb_row[span.start * 3..span.end * 3].as_chunks_mut::<3>().0)
+                    .zip(out_row[span.start * 4..span.end * 4].as_chunks_mut::<4>().0)
+                {
+                    if *weight > 1e-8 {
+                        for channel in 0..3 {
+                            out[channel] = (rgb[channel] / *weight).round().clamp(0.0, 255.0) as u8;
+                        }
+                        out[3] = 255;
+                    }
+                    *weight = 0.0;
+                    rgb.fill(0.0);
+                }
+            },
+        );
 
         RgbaImage::new(width as u32, height as u32, output)
     }
@@ -245,6 +279,13 @@ fn prepare_layers(layers: &[WarpLayer], options: &WarpOptions) -> CoreResult<Vec
             .ceil()
             .min(options.canvas_height as f64 - 1.0) as i64;
 
+        let outline = convex_outline(
+            &layer.homography,
+            &quad,
+            layer.image.width(),
+            layer.image.height(),
+        );
+
         let preview = layer.image.resized_to_fit(ANALYSIS_LIMIT);
         let gray = preview.to_gray();
         let focus = FocusMap::new(&gray, FOCUS_TILE_COLUMNS, FOCUS_TILE_ROWS);
@@ -259,6 +300,7 @@ fn prepare_layers(layers: &[WarpLayer], options: &WarpOptions) -> CoreResult<Vec
             min_y,
             max_x,
             max_y,
+            outline,
             feather,
             crop,
             focus,
@@ -266,6 +308,24 @@ fn prepare_layers(layers: &[WarpLayer], options: &WarpOptions) -> CoreResult<Vec
         });
     }
     Ok(prepared)
+}
+
+/// The projective image of a rectangle is a convex quadrilateral when no part
+/// of the rectangle maps through infinity, that is when the homogeneous scale
+/// keeps one sign at all corners.
+fn convex_outline(
+    homography: &Homography,
+    quad: &[Point; 4],
+    width: u32,
+    height: u32,
+) -> Option<[Point; 4]> {
+    let m = &homography.m;
+    let w = width.saturating_sub(1) as f64;
+    let h = height.saturating_sub(1) as f64;
+    let scales = [(0.0, 0.0), (w, 0.0), (w, h), (0.0, h)].map(|(x, y)| m[6] * x + m[7] * y + m[8]);
+    let positive = scales.iter().all(|scale| *scale > 0.0);
+    let negative = scales.iter().all(|scale| *scale < 0.0);
+    (positive || negative).then_some(*quad)
 }
 
 fn inverse_point(inverse: &Homography, x: f64, y: f64) -> Option<(f64, f64)> {

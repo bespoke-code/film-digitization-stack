@@ -1,4 +1,4 @@
-# Scan to image
+# Scan to Image
 
 Turn overlapping digital-camera scans of film negatives into one clean positive
 image. Everything runs locally in a single native Rust binary: no cloud service,
@@ -45,7 +45,7 @@ just install
 ```
 
 `just install` puts the binary in `~/.local/bin` and adds a desktop entry on
-Linux. On macOS it installs `Scan to image.app` in `~/Applications` and links
+Linux. On macOS it installs `Scan to Image.app` in `~/Applications` and links
 the binary into `~/.local/bin`. Pass a prefix to override the binary location:
 `just install /usr/local`.
 
@@ -69,7 +69,9 @@ scan-to-img scans/*.jpg
    controls in the Develop pane when a scan is sideways.
 3. If a pair has no usable detail, press **Rough arrange…**, then drag, rotate or
    scale the frames and apply. Row and Column give a fresh starting layout.
-4. Inspect the result in the zoomable preview and rotate the panorama if needed.
+4. Inspect the result in the preview: pinch or scroll with two fingers on a
+   trackpad, use the mouse wheel, or double-click for actual pixels. Rotate the
+   panorama if needed.
    Use **Crop** to drag a selection, move or resize it, then press **Apply crop**.
 5. Existing EXIF details appear automatically. Add or change camera, lens, film and
    exposure details in the **Metadata** pane. PNG, JPEG and WebP exports embed them
@@ -77,6 +79,11 @@ scan-to-img scans/*.jpg
 6. Export as PNG, JPEG, TIFF, WebP or BMP. JPEG quality defaults to the source
    JPEG quality (the lowest source in a panorama) and can be changed in the
    export dialog.
+
+Every action is in the menu bar on macOS, with the usual shortcuts (⌘O, ⌘E,
+⌘R and so on); Linux uses the same shortcuts with Ctrl. On macOS the app
+uses the system Open and Save panels; Linux has a built-in panel laid out the
+same way.
 
 Source files are never modified.
 

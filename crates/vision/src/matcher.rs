@@ -6,9 +6,9 @@ use stitch_domain::{FeatureMatch, FeatureMatcher, FeatureSet};
 /// Ratio-test matcher.
 ///
 /// A match is accepted when the best descriptor distance is below `ratio` times
-/// the second-best distance. The inner loop abandons a candidate as soon as its
-/// partial squared distance cannot beat the current runner-up, which keeps
-/// brute force practical for a handful of multi-megapixel scans.
+/// the second-best distance. The inner loop abandons a candidate as soon as a
+/// block of its partial squared distance cannot beat the current runner-up,
+/// which keeps brute force practical for a handful of multi-megapixel scans.
 #[derive(Clone, Debug, Default)]
 pub struct RatioMatcher {
     /// Reject matches whose absolute distance is larger than this (L2 in
@@ -24,46 +24,49 @@ impl RatioMatcher {
     }
 }
 
-impl FeatureMatcher for RatioMatcher {
-    fn match_features(
-        &self,
-        query: &FeatureSet,
-        train: &FeatureSet,
-        ratio: f32,
-    ) -> Vec<FeatureMatch> {
-        if query.is_empty() || train.len() < 2 {
-            return Vec::new();
-        }
-        let ratio = ratio.clamp(0.1, 0.99);
-        let max_squared = self.max_distance.map(|d| d * d);
+/// Squared distances to the nearest and second-nearest train descriptors.
+struct Neighbours {
+    best_index: usize,
+    best: f32,
+    second: f32,
+}
 
+/// Descriptor values summed per block before the abandon test. Independent
+/// lanes let the compiler use SIMD for the squared differences.
+const BLOCK: usize = 32;
+const LANES: usize = 8;
+
+impl RatioMatcher {
+    fn neighbours(query: &FeatureSet, train: &FeatureSet) -> Vec<Option<Neighbours>> {
         query
             .features
             .par_iter()
-            .enumerate()
-            .filter_map(|(query_index, feature)| {
+            .map(|feature| {
                 let mut best = f32::INFINITY;
                 let mut second = f32::INFINITY;
                 let mut best_index = 0usize;
 
-                for (train_index, candidate) in train.features.iter().enumerate() {
+                'candidates: for (train_index, candidate) in train.features.iter().enumerate() {
                     let mut distance = 0.0f32;
-                    let mut abandoned = false;
-                    for (a, b) in feature
-                        .descriptor
-                        .values
-                        .iter()
-                        .zip(candidate.descriptor.values.iter())
-                    {
-                        let difference = a - b;
-                        distance += difference * difference;
-                        if distance >= second {
-                            abandoned = true;
-                            break;
+                    let blocks = feature.descriptor.values.as_chunks::<BLOCK>().0;
+                    let candidate_blocks = candidate.descriptor.values.as_chunks::<BLOCK>().0;
+                    for (a_block, b_block) in blocks.iter().zip(candidate_blocks) {
+                        let mut lanes = [0.0f32; LANES];
+                        for (a, b) in a_block
+                            .as_chunks::<LANES>()
+                            .0
+                            .iter()
+                            .zip(b_block.as_chunks::<LANES>().0)
+                        {
+                            for lane in 0..LANES {
+                                let difference = a[lane] - b[lane];
+                                lanes[lane] += difference * difference;
+                            }
                         }
-                    }
-                    if abandoned {
-                        continue;
+                        distance += lanes.iter().sum::<f32>();
+                        if distance >= second {
+                            continue 'candidates;
+                        }
                     }
                     if distance < best {
                         second = best;
@@ -74,21 +77,56 @@ impl FeatureMatcher for RatioMatcher {
                     }
                 }
 
-                if !best.is_finite() || !second.is_finite() || second <= 0.0 {
-                    return None;
-                }
-                if let Some(limit) = max_squared {
-                    if best > limit {
-                        return None;
-                    }
-                }
-                let distance = best.sqrt();
-                let runner_up = second.sqrt();
-                if distance < ratio * runner_up {
-                    Some(FeatureMatch::new(query_index, best_index, distance))
-                } else {
-                    None
-                }
+                (best.is_finite() && second.is_finite() && second > 0.0).then_some(Neighbours {
+                    best_index,
+                    best,
+                    second,
+                })
+            })
+            .collect()
+    }
+}
+
+impl FeatureMatcher for RatioMatcher {
+    fn match_features(
+        &self,
+        query: &FeatureSet,
+        train: &FeatureSet,
+        ratio: f32,
+    ) -> Vec<FeatureMatch> {
+        self.match_features_with_ratios(query, train, &[ratio])
+            .pop()
+            .unwrap_or_default()
+    }
+
+    fn match_features_with_ratios(
+        &self,
+        query: &FeatureSet,
+        train: &FeatureSet,
+        ratios: &[f32],
+    ) -> Vec<Vec<FeatureMatch>> {
+        if query.is_empty() || train.len() < 2 {
+            return vec![Vec::new(); ratios.len()];
+        }
+        let max_squared = self.max_distance.map(|d| d * d);
+        let neighbours = Self::neighbours(query, train);
+        ratios
+            .iter()
+            .map(|ratio| {
+                let ratio = ratio.clamp(0.1, 0.99);
+                neighbours
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(query_index, found)| {
+                        let found = found.as_ref()?;
+                        if max_squared.is_some_and(|limit| found.best > limit) {
+                            return None;
+                        }
+                        let distance = found.best.sqrt();
+                        (distance < ratio * found.second.sqrt())
+                            .then(|| FeatureMatch::new(query_index, found.best_index, distance))
+                    })
+                    .collect()
             })
             .collect()
     }
@@ -138,6 +176,21 @@ mod tests {
         let b = FeatureSet::new(vec![feature(1.0, 0), feature(2.0, 1)]);
         let matcher = RatioMatcher::with_max_distance(1.0);
         assert!(matcher.match_features(&a, &b, 0.99).is_empty());
+    }
+
+    #[test]
+    fn several_ratios_match_like_separate_calls() {
+        let a = FeatureSet::new((0..12).map(|i| feature(i as f32 * 0.3, i)).collect());
+        let b = FeatureSet::new(
+            (0..12)
+                .map(|i| feature(i as f32 * 0.31 + 0.05, i))
+                .collect(),
+        );
+        let matcher = RatioMatcher::default();
+        let together = matcher.match_features_with_ratios(&a, &b, &[0.5, 0.9]);
+        assert_eq!(together[0], matcher.match_features(&a, &b, 0.5));
+        assert_eq!(together[1], matcher.match_features(&a, &b, 0.9));
+        assert!(together[0].len() <= together[1].len());
     }
 
     #[test]

@@ -113,6 +113,20 @@ pub trait FeatureMatcher: Send + Sync {
         train: &FeatureSet,
         ratio: f32,
     ) -> Vec<FeatureMatch>;
+
+    /// Returns one match list per ratio. An implementation can search the
+    /// neighbours once and apply every ratio to the same result.
+    fn match_features_with_ratios(
+        &self,
+        query: &FeatureSet,
+        train: &FeatureSet,
+        ratios: &[f32],
+    ) -> Vec<Vec<FeatureMatch>> {
+        ratios
+            .iter()
+            .map(|ratio| self.match_features(query, train, *ratio))
+            .collect()
+    }
 }
 
 /// Robustly estimates the transform that maps query points onto train points.

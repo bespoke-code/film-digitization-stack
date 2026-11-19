@@ -5,10 +5,9 @@ use std::time::Instant;
 
 use stitch_domain::{
     Clock, ColorCurve, Compositor, CoreError, CoreResult, FeatureExtractor, FeatureMatcher,
-    FeatureSet, GrayImage, Homography, HomographyEstimate, HomographyEstimator, ImageId,
-    ImagePlacement, PairDiagnostics, Point, ProgressSink, RgbaImage, SourceImage,
-    StitchDiagnostics, StitchOptions, StitchProgress, StitchResult, StitchStage, WarpOptions,
-    MAX_IMAGES,
+    FeatureSet, Homography, HomographyEstimate, HomographyEstimator, ImageId, ImagePlacement,
+    PairDiagnostics, Point, ProgressSink, RgbaImage, SourceImage, StitchDiagnostics, StitchOptions,
+    StitchProgress, StitchResult, StitchStage, WarpOptions, MAX_IMAGES,
 };
 
 use crate::bundle::{refine_transforms, PairLink};
@@ -168,10 +167,8 @@ impl StitchService {
         }
 
         let analyses = self.extract_all(images, &options, progress)?;
-        let features: Vec<FeatureSet> = analyses
-            .iter()
-            .map(|analysis| analysis.features.clone())
-            .collect();
+        let features: Vec<&FeatureSet> =
+            analyses.iter().map(|analysis| &analysis.features).collect();
 
         progress.report(StitchProgress::new(
             StitchStage::EstimatingTransforms,
@@ -231,7 +228,7 @@ impl StitchService {
             image: Arc::new(composited),
             placements,
             diagnostics: StitchDiagnostics {
-                features_per_image: features.iter().map(FeatureSet::len).collect(),
+                features_per_image: features.iter().map(|set| set.len()).collect(),
                 pairs,
                 duration_ms: self.clock.now_ms().saturating_sub(started) as u128,
                 output_width: plan.width,
@@ -260,7 +257,8 @@ impl StitchService {
             let resized = source.resized_to_fit(options.max_analysis_dimension);
             let scale_x = resized.width() as f64 / source.width() as f64;
             let scale_y = resized.height() as f64 / source.height() as f64;
-            let gray = to_gray(&resized);
+            let gray = resized.to_gray();
+            drop(resized);
             let mut features = self.extractor.extract(&gray).map_err(|error| {
                 CoreError::FeatureExtraction(format!("{}: {error}", image.name))
             })?;
@@ -269,6 +267,7 @@ impl StitchService {
                 .features
                 .sort_by(|a, b| b.keypoint.response.total_cmp(&a.keypoint.response));
             features.features.truncate(options.max_features);
+            features.features.shrink_to_fit();
 
             analyses.push(AnalysisImage {
                 scale_x,
@@ -283,7 +282,7 @@ impl StitchService {
         &self,
         images: &[SourceImage],
         analyses: &[AnalysisImage],
-        features: &[FeatureSet],
+        features: &[&FeatureSet],
         manual: &[Option<Homography>],
         options: &StitchOptions,
         progress: &dyn ProgressSink,
@@ -426,28 +425,34 @@ impl StitchService {
         target_index: usize,
         images: &[SourceImage],
         analyses: &[AnalysisImage],
-        features: &[FeatureSet],
+        features: &[&FeatureSet],
         options: &StitchOptions,
         diagnostics: &mut Vec<PairDiagnostics>,
     ) -> Option<Candidate> {
-        let query_features = &features[query_index];
-        let target_features = &features[target_index];
-        let mut matches =
-            self.matcher
-                .match_features(query_features, target_features, options.match_ratio);
-        let mut estimate = self.estimate_pair(query_features, target_features, &matches, options);
-
+        let query_features = features[query_index];
+        let target_features = features[target_index];
         // A blurred or low-contrast frame can lose its matches under the strict
         // ratio. Retry once with a relaxed ratio before declaring no overlap.
+        // Both ratios come from one neighbour search.
+        let relaxed_ratio = (options.match_ratio + 0.1).min(0.95);
+        let ratios: &[f32] = if relaxed_ratio > options.match_ratio {
+            &[options.match_ratio, relaxed_ratio]
+        } else {
+            &[options.match_ratio]
+        };
+        let mut lists = self
+            .matcher
+            .match_features_with_ratios(query_features, target_features, ratios)
+            .into_iter();
+        let mut matches = lists.next().unwrap_or_default();
+        let relaxed = lists.next();
+        let mut estimate = self.estimate_pair(query_features, target_features, &matches, options);
+
         let weak = estimate
             .as_ref()
             .map(|estimate| estimate.inliers.len() < options.min_inliers * 2)
             .unwrap_or(true);
-        let relaxed_ratio = (options.match_ratio + 0.1).min(0.95);
-        if weak && relaxed_ratio > options.match_ratio {
-            let relaxed =
-                self.matcher
-                    .match_features(query_features, target_features, relaxed_ratio);
+        if let Some(relaxed) = relaxed.filter(|_| weak) {
             if relaxed.len() > matches.len() {
                 if let Some(relaxed_estimate) =
                     self.estimate_pair(query_features, target_features, &relaxed, options)
@@ -530,7 +535,6 @@ impl StitchService {
     }
 }
 
-#[derive(Clone)]
 struct AnalysisImage {
     scale_x: f64,
     scale_y: f64,
@@ -681,10 +685,6 @@ fn bounds(quad: &[Point; 4]) -> (f64, f64, f64, f64) {
     (min_x, min_y, max_x, max_y)
 }
 
-fn to_gray(image: &stitch_domain::RgbaImage) -> GrayImage {
-    image.to_gray()
-}
-
 /// Converts an analysis-coordinate transform into source-image coordinates.
 fn to_original_coordinates(
     estimate: &HomographyEstimate,
@@ -708,7 +708,8 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
     use stitch_domain::{
-        Descriptor, Feature, FeatureMatch, ImageId, ImageLocator, Keypoint, LoadedImage, RgbaImage,
+        Descriptor, Feature, FeatureMatch, GrayImage, ImageId, ImageLocator, Keypoint, LoadedImage,
+        RgbaImage,
     };
 
     /// Extractor that emits a fixed set of features so the orchestration can be

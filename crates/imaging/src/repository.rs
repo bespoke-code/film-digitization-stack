@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use image::codecs::jpeg::JpegEncoder;
 use image::metadata::Orientation;
 use image::{
-    DynamicImage, ExtendedColorType, ImageDecoder, ImageFormat, ImageReader,
+    ColorType, DynamicImage, ExtendedColorType, ImageDecoder, ImageFormat, ImageReader,
     RgbaImage as ImageRgbaImage,
 };
 use stitch_domain::{
@@ -68,6 +68,8 @@ impl ImageRepository for FileImageRepository {
             path: locator.as_str().to_owned(),
             message: error.to_string(),
         })?;
+        let metadata = extract_metadata(&bytes);
+        let jpeg_quality = jpeg_quality(&bytes);
         let decode_error = |error: image::ImageError| CoreError::Decode {
             name: locator.display_name(),
             message: error.to_string(),
@@ -84,11 +86,11 @@ impl ImageRepository for FileImageRepository {
         // Applying it here means every later step sees the upright photo, and
         // exports, which carry no orientation tag, stay upright too.
         let orientation = decoder.orientation().unwrap_or(Orientation::NoTransforms);
-        let mut decoded = DynamicImage::from_decoder(decoder).map_err(decode_error)?;
-        decoded.apply_orientation(orientation);
-        let metadata = extract_metadata(&bytes);
-        let jpeg_quality = jpeg_quality(&bytes);
-        let mut rgba = decoded.to_rgba8();
+        let rgba = decode_rgba(decoder).map_err(decode_error)?;
+        drop(bytes);
+        let mut oriented = DynamicImage::ImageRgba8(rgba);
+        oriented.apply_orientation(orientation);
+        let mut rgba = oriented.into_rgba8();
         if let Some(max_dimension) = self.max_dimension {
             let (width, height) = rgba.dimensions();
             if width.max(height) > max_dimension {
@@ -117,12 +119,13 @@ impl ImageRepository for FileImageRepository {
         })
     }
 
-    /// Reads only the header. The peak covers the file bytes, the decoder's
-    /// native buffer and the RGBA copy that becomes the loaded image.
+    /// Reads only the header. The peak covers the file bytes, the RGBA image,
+    /// and either the decoder's native buffer for formats that are converted
+    /// or the second buffer of a quarter turn.
     fn estimate_load(&self, locator: &ImageLocator) -> Option<LoadEstimate> {
         let path = Self::path(locator);
         let file_bytes = std::fs::metadata(path).ok()?.len();
-        let decoder = ImageReader::open(path)
+        let mut decoder = ImageReader::open(path)
             .ok()?
             .with_guessed_format()
             .ok()?
@@ -130,9 +133,25 @@ impl ImageRepository for FileImageRepository {
             .ok()?;
         let (width, height) = decoder.dimensions();
         let retained = u64::from(width) * u64::from(height) * 4;
+        let native = if matches!(
+            decoder.color_type(),
+            ColorType::L8 | ColorType::Rgb8 | ColorType::Rgba8
+        ) {
+            0
+        } else {
+            decoder.total_bytes()
+        };
+        // A quarter turn writes the upright pixels into a second buffer.
+        let turned = match decoder.orientation().unwrap_or(Orientation::NoTransforms) {
+            Orientation::Rotate90
+            | Orientation::Rotate270
+            | Orientation::Rotate90FlipH
+            | Orientation::Rotate270FlipH => retained,
+            _ => 0,
+        };
         Some(LoadEstimate {
             retained,
-            peak: file_bytes + decoder.total_bytes() + retained,
+            peak: file_bytes + native.max(turned) + retained,
         })
     }
 
@@ -194,34 +213,34 @@ impl FileImageRepository {
         ) {
             return Err(CoreError::UnsupportedFormat(locator.as_str().to_owned()));
         }
-        let rgba = ImageRgbaImage::from_raw(image.width(), image.height(), image.pixels().to_vec())
-            .ok_or_else(|| {
-                CoreError::InvalidImage(
-                    "the output buffer does not match its dimensions".to_owned(),
-                )
-            })?;
-        let dynamic = DynamicImage::ImageRgba8(rgba);
+        // Encode from the borrowed canvas: a full-resolution panorama is
+        // hundreds of megabytes, and a copy would double the export peak.
+        let encode_error = |error: image::ImageError| CoreError::Encode {
+            name: locator.display_name(),
+            message: error.to_string(),
+        };
         let mut bytes = Vec::new();
         if format == ImageFormat::Jpeg {
-            let rgb = dynamic.to_rgb8();
+            let rgb: Vec<u8> = image
+                .pixels()
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .flat_map(|pixel| [pixel[0], pixel[1], pixel[2]])
+                .collect();
             JpegEncoder::new_with_quality(&mut bytes, options.jpeg_quality.clamp(1, 100))
-                .encode(
-                    rgb.as_raw(),
-                    rgb.width(),
-                    rgb.height(),
-                    ExtendedColorType::Rgb8,
-                )
-                .map_err(|error| CoreError::Encode {
-                    name: locator.display_name(),
-                    message: error.to_string(),
-                })?;
+                .encode(&rgb, image.width(), image.height(), ExtendedColorType::Rgb8)
+                .map_err(encode_error)?;
         } else {
-            dynamic
-                .write_to(&mut Cursor::new(&mut bytes), format)
-                .map_err(|error| CoreError::Encode {
-                    name: locator.display_name(),
-                    message: error.to_string(),
-                })?;
+            image::write_buffer_with_format(
+                &mut Cursor::new(&mut bytes),
+                image.pixels(),
+                image.width(),
+                image.height(),
+                ExtendedColorType::Rgba8,
+                format,
+            )
+            .map_err(encode_error)?;
         }
         Ok((bytes, format))
     }
@@ -307,6 +326,41 @@ impl Drop for TempFileGuard {
         if !self.committed {
             let _ = std::fs::remove_file(&self.path);
         }
+    }
+}
+
+/// Decodes into the final RGBA buffer. 8-bit gray and RGB pixels are read
+/// into the front of that buffer and widened in place, so a large scan never
+/// holds a second full-size copy in its native layout.
+fn decode_rgba(decoder: impl ImageDecoder) -> image::ImageResult<ImageRgbaImage> {
+    let (width, height) = decoder.dimensions();
+    let color = decoder.color_type();
+    if !matches!(color, ColorType::L8 | ColorType::Rgb8 | ColorType::Rgba8) {
+        return Ok(DynamicImage::from_decoder(decoder)?.into_rgba8());
+    }
+    let native = decoder.total_bytes() as usize;
+    let mut pixels = vec![0u8; width as usize * height as usize * 4];
+    decoder.read_image(&mut pixels[..native])?;
+    widen_to_rgba(&mut pixels, color.channel_count() as usize);
+    Ok(ImageRgbaImage::from_raw(width, height, pixels)
+        .expect("the buffer is sized from the decoder dimensions"))
+}
+
+/// Expands packed gray or RGB pixels at the start of `pixels` to RGBA. The
+/// walk runs from the last pixel, so no source byte is overwritten before it
+/// is read.
+fn widen_to_rgba(pixels: &mut [u8], channels: usize) {
+    if channels == 4 {
+        return;
+    }
+    for index in (0..pixels.len() / 4).rev() {
+        let source = index * channels;
+        let rgb = if channels == 1 {
+            [pixels[source]; 3]
+        } else {
+            [pixels[source], pixels[source + 1], pixels[source + 2]]
+        };
+        pixels[index * 4..index * 4 + 4].copy_from_slice(&[rgb[0], rgb[1], rgb[2], 255]);
     }
 }
 
@@ -440,6 +494,17 @@ mod tests {
         assert!(estimate.peak > estimate.retained);
         let missing = ImageLocator::new(dir.path().join("none.png").to_string_lossy());
         assert_eq!(repository.estimate_load(&missing), None);
+    }
+
+    #[test]
+    fn gray_and_rgb_pixels_widen_in_place() {
+        let mut rgb = vec![1, 2, 3, 4, 5, 6, 0, 0];
+        widen_to_rgba(&mut rgb, 3);
+        assert_eq!(rgb, [1, 2, 3, 255, 4, 5, 6, 255]);
+
+        let mut gray = vec![7, 9, 0, 0, 0, 0, 0, 0];
+        widen_to_rgba(&mut gray, 1);
+        assert_eq!(gray, [7, 7, 7, 255, 9, 9, 9, 255]);
     }
 
     #[test]
